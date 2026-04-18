@@ -39,6 +39,7 @@ copyright = "© AKatsuKi Inc. All rights reserved."
 [tool.poetry.scripts]
 senpwai = "senpwai.main:main"
 senpcli = "senpwai.senpcli.main:main"
+senpweb = "senpwai.webui.server:main"
 
 [tool.poetry.dependencies]
 python = "^3.11"
@@ -53,6 +54,8 @@ argparse = "^1.4.0"
 pylnk3 = "^0.4.2"
 pyqt6 = "^6.6.1"
 curl_cffi = ">=0.7,<0.14"
+fastapi = ">=0.111,<1.0"
+uvicorn = {extras = ["standard"], version = ">=0.29,<1.0"}
 
 [tool.poetry.group.dev.dependencies]
 cx-freeze = "^6.15.12"

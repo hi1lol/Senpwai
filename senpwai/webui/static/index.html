@@ -1,0 +1,718 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Senpweb</title>
+  <style>
+    :root {
+      --bg:        #0f0f1a;
+      --card:      #1a1a2e;
+      --border:    #2a2a4a;
+      --primary:   #7c4dff;
+      --primary-h: #9c6dff;
+      --cyan:      #00e5ff;
+      --text:      #e0e0e0;
+      --muted:     #888;
+      --success:   #4caf50;
+      --error:     #f44336;
+      --warn:      #ff9800;
+      --radius:    10px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; font-size: 14px; min-height: 100vh; }
+
+    /* Header */
+    header {
+      position: sticky; top: 0; z-index: 100;
+      background: var(--card); border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0 20px; height: 52px;
+    }
+    header h1 { font-size: 20px; color: var(--primary); letter-spacing: 1px; }
+    #active-badge {
+      background: var(--primary); color: #fff; border-radius: 20px;
+      padding: 3px 10px; font-size: 12px; font-weight: 600;
+      display: none;
+    }
+    #active-badge.visible { display: inline-block; }
+
+    /* Layout */
+    main { max-width: 860px; margin: 0 auto; padding: 20px 16px 60px; }
+
+    /* Cards */
+    .card {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 16px; margin-bottom: 16px;
+    }
+    .card-title { font-size: 15px; font-weight: 600; margin-bottom: 12px; color: var(--cyan); }
+
+    /* Buttons */
+    button {
+      cursor: pointer; border: none; border-radius: 6px;
+      padding: 7px 14px; font-size: 13px; font-weight: 500; transition: opacity .15s;
+    }
+    button:hover { opacity: .85; }
+    button:disabled { opacity: .4; cursor: default; }
+    .btn-primary { background: var(--primary); color: #fff; }
+    .btn-ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
+    .btn-danger { background: var(--error); color: #fff; }
+    .btn-sm { padding: 4px 10px; font-size: 12px; }
+
+    /* Search row */
+    .search-row { display: flex; gap: 8px; }
+    .search-row input { flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 7px 10px; font-size: 13px; }
+    .search-row input:focus { outline: none; border-color: var(--primary); }
+
+    /* Results */
+    #search-results { margin-top: 12px; display: flex; flex-direction: column; gap: 6px; }
+    .result-item {
+      background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+      padding: 8px 12px; cursor: pointer; transition: border-color .15s;
+    }
+    .result-item:hover { border-color: var(--primary); }
+    .result-item.selected { border-color: var(--primary); background: #1e1040; }
+
+    /* Anime details panel */
+    #details-panel { display: none; }
+    #details-panel.visible { display: block; }
+    .details-inner { display: flex; gap: 14px; }
+    .details-poster { width: 90px; flex-shrink: 0; }
+    .details-poster img { width: 90px; border-radius: 6px; display: block; }
+    .details-info { flex: 1; min-width: 0; }
+    .details-info h3 { font-size: 15px; margin-bottom: 4px; }
+    .details-info .meta { color: var(--muted); font-size: 12px; margin-bottom: 8px; display: flex; gap: 8px; flex-wrap: wrap; }
+    .details-info .summary { color: var(--muted); font-size: 12px; line-height: 1.5; max-height: 60px; overflow: hidden; }
+
+    /* Download options */
+    .dl-options { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; align-items: flex-end; }
+    .dl-field { display: flex; flex-direction: column; gap: 4px; }
+    .dl-field label { font-size: 11px; color: var(--muted); }
+    .dl-field input, .dl-field select {
+      background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+      color: var(--text); padding: 6px 8px; font-size: 13px; width: 100px;
+    }
+    .dl-field input:focus, .dl-field select:focus { outline: none; border-color: var(--primary); }
+    .dl-field select option { background: var(--card); }
+    #hls-field { display: none; }
+    #hls-field.visible { display: flex; }
+
+    /* Badges */
+    .badge {
+      display: inline-block; border-radius: 20px; padding: 2px 8px;
+      font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .5px;
+    }
+    .badge-queued    { background: #333; color: var(--muted); }
+    .badge-resolving { background: #1a3a5c; color: var(--cyan); }
+    .badge-downloading { background: #1a2e5c; color: #6699ff; }
+    .badge-done      { background: #1a3a1a; color: var(--success); }
+    .badge-failed    { background: #3a1a1a; color: var(--error); }
+    .badge-cancelled { background: #2a2a2a; color: var(--muted); }
+    .badge-pahe      { background: #2a1a4a; color: #b388ff; }
+    .badge-dub       { background: #3a2a0a; color: var(--warn); }
+
+    /* Queue */
+    #queue-section h2 { font-size: 16px; font-weight: 600; margin-bottom: 12px; }
+    #queue-list { display: flex; flex-direction: column; gap: 10px; }
+    #queue-empty { color: var(--muted); text-align: center; padding: 32px 0; display: none; }
+    #queue-empty.visible { display: block; }
+
+    /* Job card */
+    .job-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+    .job-header { display: flex; align-items: center; gap: 8px; padding: 10px 14px; flex-wrap: wrap; }
+    .job-title { flex: 1; min-width: 0; font-weight: 600; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .job-meta { display: flex; gap: 6px; align-items: center; }
+    .job-body { padding: 0 14px 12px; }
+
+    /* Progress bars */
+    .resolve-bar { margin-bottom: 8px; }
+    .resolve-label { font-size: 11px; color: var(--muted); margin-bottom: 4px; display: flex; justify-content: space-between; }
+    progress { width: 100%; height: 6px; border-radius: 3px; border: none; appearance: none; }
+    progress::-webkit-progress-bar { background: var(--bg); border-radius: 3px; }
+    progress::-webkit-progress-value { background: var(--primary); border-radius: 3px; transition: width .3s; }
+    progress::-moz-progress-bar { background: var(--primary); border-radius: 3px; }
+
+    .ep-list { display: flex; flex-direction: column; gap: 6px; }
+    .ep-row { font-size: 12px; }
+    .ep-name { color: var(--muted); margin-bottom: 3px; display: flex; justify-content: space-between; }
+    .ep-name span { color: var(--text); }
+    progress.ep-bar { height: 5px; }
+    progress.ep-bar::-webkit-progress-value { background: var(--cyan); }
+    progress.ep-bar::-moz-progress-bar { background: var(--cyan); }
+    progress.ep-done::-webkit-progress-value { background: var(--success); }
+    progress.ep-done::-moz-progress-bar { background: var(--success); }
+
+    .error-msg { color: var(--error); font-size: 12px; margin-top: 6px; background: #2a0a0a; border-radius: 6px; padding: 6px 10px; word-break: break-word; }
+
+    /* Settings */
+    details { margin-bottom: 16px; }
+    summary { cursor: pointer; font-size: 15px; font-weight: 600; color: var(--cyan); padding: 8px 0; list-style: none; display: flex; align-items: center; gap: 6px; }
+    summary::before { content: '▶'; font-size: 10px; transition: transform .2s; }
+    details[open] summary::before { transform: rotate(90deg); }
+    .settings-grid { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 12px; }
+    .settings-field { display: flex; flex-direction: column; gap: 4px; }
+    .settings-field label { font-size: 11px; color: var(--muted); }
+    .settings-field select, .settings-field input {
+      background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+      color: var(--text); padding: 6px 8px; font-size: 13px;
+    }
+    .settings-field select:focus, .settings-field input:focus { outline: none; border-color: var(--primary); }
+    .folder-list { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
+    .folder-item { font-size: 12px; color: var(--muted); background: var(--bg); border-radius: 4px; padding: 4px 8px; }
+    .save-row { margin-top: 14px; display: flex; align-items: center; gap: 10px; }
+    #save-msg { font-size: 12px; color: var(--success); display: none; }
+    #save-msg.visible { display: inline; }
+
+    /* Spinner */
+    .spinner {
+      display: inline-block; width: 12px; height: 12px;
+      border: 2px solid var(--border); border-top-color: var(--cyan);
+      border-radius: 50%; animation: spin .6s linear infinite;
+      vertical-align: middle; margin-right: 6px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Loading overlay for search */
+    #search-loading { display: none; color: var(--muted); font-size: 12px; margin-top: 8px; }
+    #search-loading.visible { display: flex; align-items: center; gap: 6px; }
+    #details-loading { display: none; color: var(--muted); font-size: 12px; padding: 12px 0; }
+    #details-loading.visible { display: flex; align-items: center; gap: 6px; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>Senpweb</h1>
+  <span id="active-badge">0 active</span>
+</header>
+
+<main>
+  <!-- Search -->
+  <div class="card">
+    <div class="card-title">Search</div>
+    <div class="search-row">
+      <input type="text" id="search-input" placeholder="Search anime..." onkeydown="if(event.key==='Enter') doSearch()">
+      <button class="btn-primary" onclick="doSearch()" id="search-btn">Search</button>
+    </div>
+    <div id="search-loading"><span class="spinner"></span> Searching...</div>
+    <div id="search-results"></div>
+  </div>
+
+  <!-- Details panel -->
+  <div class="card" id="details-panel">
+    <div id="details-loading"><span class="spinner"></span> Fetching details...</div>
+    <div id="details-content" style="display:none">
+      <div class="details-inner">
+        <div class="details-poster"><img id="poster-img" src="" alt="poster"></div>
+        <div class="details-info">
+          <h3 id="details-title"></h3>
+          <div class="meta" id="details-meta"></div>
+          <div class="summary" id="details-summary"></div>
+        </div>
+      </div>
+      <div class="dl-options">
+        <div class="dl-field">
+          <label>Start episode</label>
+          <input type="number" id="start-ep" min="1" value="1">
+        </div>
+        <div class="dl-field">
+          <label>End episode</label>
+          <input type="number" id="end-ep" min="1" value="1">
+        </div>
+        <div class="dl-field">
+          <label>Quality</label>
+          <select id="quality-sel">
+            <option value="1080p">1080p</option>
+            <option value="720p" selected>720p</option>
+            <option value="480p">480p</option>
+            <option value="360p">360p</option>
+          </select>
+        </div>
+        <div class="dl-field">
+          <label>Sub / Dub</label>
+          <select id="subdub-sel">
+            <option value="sub" selected>Sub</option>
+            <option value="dub">Dub</option>
+          </select>
+        </div>
+        <div class="dl-field" style="flex-direction:row;align-items:center;gap:8px;margin-left:auto">
+          <button class="btn-primary" onclick="addToQueue()" id="add-btn">Add to Queue</button>
+          <button class="btn-ghost" onclick="browserDownload()" id="browser-dl-btn">⬇ Download to Browser</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Queue -->
+  <div id="queue-section">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+      <h2 style="margin:0">Downloads</h2>
+      <button class="btn-primary btn-sm" onclick="startAll()">▶ Start All</button>
+    </div>
+    <div id="queue-empty" class="visible">No downloads yet.</div>
+    <div id="queue-list"></div>
+  </div>
+
+  <!-- Settings -->
+  <details>
+    <summary>Settings</summary>
+    <div class="card">
+      <div class="settings-grid">
+        <div class="settings-field">
+          <label>Default quality</label>
+          <select id="s-quality">
+            <option value="1080p">1080p</option>
+            <option value="720p">720p</option>
+            <option value="480p">480p</option>
+            <option value="360p">360p</option>
+          </select>
+        </div>
+        <div class="settings-field">
+          <label>Default sub / dub</label>
+          <select id="s-subdub">
+            <option value="sub">Sub</option>
+            <option value="dub">Dub</option>
+          </select>
+        </div>
+        <div class="settings-field">
+          <label>Max simultaneous downloads</label>
+          <input type="number" id="s-maxdl" min="1" max="10" style="width:80px">
+        </div>
+      </div>
+      <div class="folder-list" id="folder-list"></div>
+      <div class="save-row">
+        <button class="btn-primary btn-sm" onclick="saveSettings()">Save</button>
+        <span id="save-msg">Saved!</span>
+      </div>
+    </div>
+  </details>
+</main>
+
+<script>
+const state = {
+  site: 'pahe',  // always pahe now
+  settings: {},
+  results: [],
+  selected: null,    // { title, page_link, anime_id }
+  details: null,     // fetched AnimeDetails
+  jobs: {},          // job_id -> snapshot
+  sources: {},       // job_id -> EventSource
+};
+
+// --- Utilities ---
+
+function fmt(bytes) {
+  if (!bytes) return '0 B';
+  const k = 1024, s = ['B','KB','MB','GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return (bytes / k ** i).toFixed(1) + ' ' + s[i];
+}
+
+function pct(done, total) {
+  return total ? Math.min(100, Math.round(done / total * 100)) : 0;
+}
+
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// --- Search ---
+
+async function doSearch() {
+  const q = document.getElementById('search-input').value.trim();
+  if (!q) return;
+  document.getElementById('search-btn').disabled = true;
+  document.getElementById('search-loading').classList.add('visible');
+  document.getElementById('search-results').innerHTML = '';
+  hideDetails();
+  try {
+    const res = await fetch(`/api/search?q=${encodeURIComponent(q)}&site=${state.site}`);
+    const data = await res.json();
+    state.results = data.results || [];
+    renderResults();
+  } catch(e) {
+    document.getElementById('search-results').innerHTML = `<div style="color:var(--error);font-size:12px">Search failed: ${escHtml(e.message)}</div>`;
+  } finally {
+    document.getElementById('search-btn').disabled = false;
+    document.getElementById('search-loading').classList.remove('visible');
+  }
+}
+
+function renderResults() {
+  const el = document.getElementById('search-results');
+  if (!state.results.length) {
+    el.innerHTML = '<div style="color:var(--muted);font-size:12px;margin-top:8px">No results.</div>';
+    return;
+  }
+  el.innerHTML = state.results.map((r, i) =>
+    `<div class="result-item" onclick="selectAnime(${i})">${escHtml(r.title)}</div>`
+  ).join('');
+}
+
+// --- Anime details ---
+
+function hideDetails() {
+  document.getElementById('details-panel').classList.remove('visible');
+  document.getElementById('details-content').style.display = 'none';
+  document.getElementById('details-loading').classList.remove('visible');
+  state.selected = null;
+  state.details = null;
+}
+
+async function selectAnime(idx) {
+  // Highlight selected result
+  document.querySelectorAll('.result-item').forEach((el, i) =>
+    el.classList.toggle('selected', i === idx)
+  );
+
+  const r = state.results[idx];
+  state.selected = r;
+  state.details = null;
+
+  const panel = document.getElementById('details-panel');
+  panel.classList.add('visible');
+  document.getElementById('details-content').style.display = 'none';
+  document.getElementById('details-loading').classList.add('visible');
+
+  try {
+    const res = await fetch('/api/anime/details', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        title: r.title,
+        page_link: r.page_link,
+        anime_id: r.anime_id,
+        site: state.site,
+      }),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    state.details = await res.json();
+    renderDetails();
+  } catch(e) {
+    document.getElementById('details-loading').classList.remove('visible');
+    document.getElementById('details-content').style.display = 'block';
+    document.getElementById('details-content').innerHTML =
+      `<div style="color:var(--error)">Failed to fetch details: ${escHtml(e.message)}</div>`;
+  }
+}
+
+function renderDetails() {
+  const d = state.details;
+  document.getElementById('details-loading').classList.remove('visible');
+
+  document.getElementById('poster-img').src = d.poster_url || '';
+  document.getElementById('details-title').textContent = state.selected.title;
+
+  const meta = [];
+  meta.push(`<span class="badge badge-pahe">Pahe</span>`);
+  meta.push(`${d.episode_count} episodes`);
+  if (d.release_year) meta.push(d.release_year);
+  meta.push(`<span style="color:${d.airing_status === 'Ongoing' ? 'var(--warn)' : d.airing_status === 'Finished' ? 'var(--success)' : 'var(--muted)'}">${d.airing_status}</span>`);
+  if (d.dub_available) meta.push('<span class="badge badge-dub">Dub ✓</span>');
+  document.getElementById('details-meta').innerHTML = meta.join(' · ');
+  document.getElementById('details-summary').textContent = d.summary || '';
+
+  // Smart episode range defaults
+  const startEp = (d.haved_end && d.haved_end < d.episode_count) ? d.haved_end + 1 : 1;
+  document.getElementById('start-ep').value = startEp;
+  document.getElementById('end-ep').value = d.episode_count;
+  document.getElementById('end-ep').max = d.episode_count;
+  document.getElementById('start-ep').max = d.episode_count;
+
+  // Apply settings defaults
+  document.getElementById('quality-sel').value = state.settings.quality || '720p';
+  document.getElementById('subdub-sel').value = state.settings.sub_or_dub || 'sub';
+
+  document.getElementById('details-content').style.display = 'block';
+}
+
+// --- Queue ---
+
+async function addToQueue() {
+  if (!state.selected) return;
+  const btn = document.getElementById('add-btn');
+  btn.disabled = true;
+  try {
+    const body = {
+      title:         state.selected.title,
+      page_link:     state.selected.page_link,
+      anime_id:      state.selected.anime_id,
+      site:          state.site,
+      start_episode: parseInt(document.getElementById('start-ep').value),
+      end_episode:   parseInt(document.getElementById('end-ep').value),
+      quality:       document.getElementById('quality-sel').value,
+      sub_or_dub:    document.getElementById('subdub-sel').value,
+      hls_mode:      false,
+    };
+    const res = await fetch('/api/queue', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const { job_id } = await res.json();
+    subscribeSSE(job_id);
+  } catch(e) {
+    alert('Failed to add to queue: ' + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function browserDownload() {
+  if (!state.selected) return;
+  const btn = document.getElementById('browser-dl-btn');
+  btn.disabled = true;
+  btn.textContent = 'Resolving...';
+  try {
+    const body = {
+      title:         state.selected.title,
+      page_link:     state.selected.page_link,
+      anime_id:      state.selected.anime_id,
+      start_episode: parseInt(document.getElementById('start-ep').value),
+      end_episode:   parseInt(document.getElementById('end-ep').value),
+      quality:       document.getElementById('quality-sel').value,
+      sub_or_dub:    document.getElementById('subdub-sel').value,
+    };
+    const res = await fetch('/api/browser-download/resolve', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const { episodes } = await res.json();
+    // Trigger each episode as a browser file download
+    for (let i = 0; i < episodes.length; i++) {
+      const a = document.createElement('a');
+      a.href = `/api/browser-download/${episodes[i].token}`;
+      a.download = episodes[i].title + '.mp4';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      // Small gap so the browser doesn't merge them
+      if (i < episodes.length - 1) await new Promise(r => setTimeout(r, 300));
+    }
+  } catch(e) {
+    alert('Browser download failed: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '⬇ Download to Browser';
+  }
+}
+
+async function removeJob(job_id) {
+  try {
+    await fetch(`/api/queue/${job_id}`, { method: 'DELETE' });
+  } catch {}
+  delete state.jobs[job_id];
+  if (state.sources[job_id]) { state.sources[job_id].close(); delete state.sources[job_id]; }
+  const el = document.getElementById('job-' + job_id);
+  if (el) el.remove();
+  document.getElementById('queue-empty').classList.toggle('visible', Object.keys(state.jobs).length === 0);
+  updateActiveBadge();
+}
+
+// --- SSE ---
+
+function subscribeSSE(job_id) {
+  if (state.sources[job_id]) return;
+  const es = new EventSource(`/api/queue/${job_id}/events`);
+  state.sources[job_id] = es;
+  es.onmessage = (e) => {
+    const snap = JSON.parse(e.data);
+    state.jobs[snap.job_id] = snap;
+    renderJobCard(snap.job_id);
+    updateActiveBadge();
+    if (['done','failed','cancelled'].includes(snap.status)) {
+      es.close();
+      delete state.sources[snap.job_id];
+    }
+  };
+  es.onerror = () => {};
+}
+
+// --- Rendering ---
+
+function updateActiveBadge() {
+  const active = Object.values(state.jobs).filter(j =>
+    ['queued','resolving','downloading'].includes(j.status)
+  ).length;
+  const badge = document.getElementById('active-badge');
+  badge.textContent = active + ' active';
+  badge.classList.toggle('visible', active > 0);
+}
+
+function renderQueue() {
+  const jobs = Object.values(state.jobs).sort((a, b) => b.created_at - a.created_at);
+  document.getElementById('queue-empty').classList.toggle('visible', jobs.length === 0);
+  const list = document.getElementById('queue-list');
+  // Only add cards for new jobs; existing ones are updated in-place by renderJobCard
+  jobs.forEach(j => {
+    if (!document.getElementById('job-' + j.job_id)) {
+      const div = document.createElement('div');
+      div.id = 'job-' + j.job_id;
+      div.className = 'job-card';
+      list.prepend(div);
+    }
+    renderJobCard(j.job_id);
+  });
+  updateActiveBadge();
+}
+
+function renderJobCard(job_id) {
+  const j = state.jobs[job_id];
+  if (!j) return;
+  let el = document.getElementById('job-' + job_id);
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'job-' + job_id;
+    el.className = 'job-card';
+    document.getElementById('queue-list').prepend(el);
+    document.getElementById('queue-empty').classList.remove('visible');
+  }
+
+  const siteBadge = `<span class="badge badge-${j.site}">${j.site}</span>`;
+  const statusBadge = `<span class="badge badge-${j.status}">${j.status}</span>`;
+  const epRange = `Ep ${j.start_episode}–${j.end_episode}`;
+  const isTerminal = ['done','failed','cancelled'].includes(j.status);
+  const isQueued = j.status === 'queued';
+
+  let bodyHtml = '';
+
+  if (j.status === 'resolving' && j.resolve_total > 0) {
+    const p = pct(j.resolve_current, j.resolve_total);
+    bodyHtml = `
+      <div class="resolve-bar">
+        <div class="resolve-label">
+          <span><span class="spinner"></span>${escHtml(j.resolve_step)}</span>
+          <span>${j.resolve_current}/${j.resolve_total}</span>
+        </div>
+        <progress value="${j.resolve_current}" max="${j.resolve_total}"></progress>
+      </div>`;
+  } else if (j.status === 'resolving') {
+    bodyHtml = `<div style="color:var(--muted);font-size:12px"><span class="spinner"></span>${escHtml(j.resolve_step) || 'Preparing...'}</div>`;
+  } else if ((j.status === 'downloading' || isTerminal) && j.episodes.length > 0) {
+    const epRows = j.episodes.map(ep => {
+      const p = pct(ep.downloaded_bytes, ep.total_bytes);
+      const done = ep.status === 'done';
+      const cls = done ? 'ep-done' : '';
+      const sizeStr = ep.total_bytes ? `${fmt(ep.downloaded_bytes)} / ${fmt(ep.total_bytes)}` : '';
+      return `<div class="ep-row">
+        <div class="ep-name"><span>${escHtml(ep.episode_title)}</span><span>${sizeStr}</span></div>
+        <progress class="ep-bar ${cls}" value="${ep.downloaded_bytes}" max="${ep.total_bytes || 1}"></progress>
+      </div>`;
+    }).join('');
+    bodyHtml = `<div class="ep-list">${epRows}</div>`;
+  } else if (j.status === 'queued') {
+    bodyHtml = `<div style="color:var(--muted);font-size:12px">Waiting to start...</div>`;
+  }
+
+  if (j.error_message) {
+    bodyHtml += `<div class="error-msg">${escHtml(j.error_message)}</div>`;
+  }
+
+  const startBtn = isQueued
+    ? `<button class="btn-primary btn-sm" onclick="startJob('${job_id}')">▶ Start</button>`
+    : '';
+  const removeBtn = isTerminal
+    ? `<button class="btn-ghost btn-sm" onclick="removeJob('${job_id}')">Remove</button>`
+    : `<button class="btn-danger btn-sm" onclick="removeJob('${job_id}')">Cancel</button>`;
+
+  el.innerHTML = `
+    <div class="job-header">
+      <div class="job-title" title="${escHtml(j.anime_title)}">${escHtml(j.anime_title)}</div>
+      <div class="job-meta">
+        ${siteBadge}
+        <span style="color:var(--muted);font-size:12px">${epRange}</span>
+        ${statusBadge}
+        ${startBtn}
+        ${removeBtn}
+      </div>
+    </div>
+    ${bodyHtml ? `<div class="job-body">${bodyHtml}</div>` : ''}
+  `;
+}
+
+// --- Settings ---
+
+async function loadSettings() {
+  try {
+    const res = await fetch('/api/settings');
+    state.settings = await res.json();
+    document.getElementById('s-quality').value = state.settings.quality || '720p';
+    document.getElementById('s-subdub').value = state.settings.sub_or_dub || 'sub';
+    document.getElementById('s-maxdl').value = state.settings.max_simultaneous_downloads || 2;
+
+    if (state.settings.browser_only) {
+      document.getElementById('queue-section').style.display = 'none';
+      document.getElementById('add-btn').style.display = 'none';
+    }
+
+    const folders = state.settings.download_folder_paths || [];
+    document.getElementById('folder-list').innerHTML =
+      folders.length
+        ? '<div style="font-size:11px;color:var(--muted);margin-top:8px">Download folders:</div>' +
+          folders.map(f => `<div class="folder-item">${escHtml(f)}</div>`).join('')
+        : '';
+  } catch {}
+}
+
+async function saveSettings() {
+  const body = {
+    quality:                   document.getElementById('s-quality').value,
+    sub_or_dub:                document.getElementById('s-subdub').value,
+    max_simultaneous_downloads: parseInt(document.getElementById('s-maxdl').value),
+  };
+  try {
+    await fetch('/api/settings', {
+      method: 'PATCH',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    state.settings = { ...state.settings, ...body };
+    const msg = document.getElementById('save-msg');
+    msg.classList.add('visible');
+    setTimeout(() => msg.classList.remove('visible'), 2000);
+  } catch(e) {
+    alert('Failed to save settings: ' + e.message);
+  }
+}
+
+// --- Start ---
+
+async function startJob(job_id) {
+  await fetch(`/api/queue/${job_id}/start`, { method: 'POST' });
+  subscribeSSE(job_id);
+}
+
+async function startAll() {
+  const res = await fetch('/api/queue/start-all', { method: 'POST' });
+  const { started } = await res.json();
+  Object.keys(state.jobs).forEach(id => {
+    if (state.jobs[id].status === 'queued') subscribeSSE(id);
+  });
+}
+
+// --- Init ---
+
+async function init() {
+  await loadSettings();
+  try {
+    const res = await fetch('/api/queue');
+    const { jobs } = await res.json();
+    jobs.forEach(j => {
+      state.jobs[j.job_id] = j;
+      if (!['done','failed','cancelled'].includes(j.status)) {
+        subscribeSSE(j.job_id);
+      }
+    });
+    renderQueue();
+  } catch {}
+}
+
+init();
+</script>
+</body>
+</html>

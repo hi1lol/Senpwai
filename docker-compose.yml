@@ -1,0 +1,27 @@
+services:
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - LOG_LEVEL=info
+
+  senpweb:
+    build: .
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      # Downloads land here — change the left side to your preferred host path
+      - ./downloads:/root/Downloads/Anime
+      # Persist senpwai settings (quality, sub/dub, etc.) across restarts
+      - senpwai-config:/root/.config/Senpwai
+    environment:
+      # FlareSolverr is on the same host network, so localhost works
+      - FLARESOLVERR_URL=http://localhost:8191
+      # Uncomment to disable server-side queue downloads (browser download only)
+      #- SENPWEB_BROWSER_ONLY=1
+    depends_on:
+      - flaresolverr
+
+volumes:
+  senpwai-config:
