@@ -79,10 +79,13 @@ Check [Senpcli](https://github.com/SenZmaKi/Senpwai/blob/master/docs/senpcli-gui
 
 Ensure you have [Python 3.11](https://www.python.org/downloads/release/python-3119) (3.11 specifically!!!) and [Git](https://github.com/git-guides/install-git) installed.
 
-Animepahe downloads require a real Chromium browser to solve Cloudflare's JS challenge on `kwik.cx` (cached for ~20 minutes per run). Install:
+Animepahe downloads require [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) to solve Cloudflare's JS challenge on `kwik.cx` (result cached for ~20 minutes). Start it before running Senpwai:
 
--   **Chromium** — e.g., `sudo pacman -S chromium` (Arch), `sudo apt install chromium` (Debian/Ubuntu), or `brew install --cask chromium` (macOS). On Windows, Chrome/Edge works.
--   **Xvfb** (Linux headless / CLI-only sessions without a display) — e.g., `sudo pacman -S xorg-server-xvfb` or `sudo apt install xvfb`. The CF challenge detects real headless Chromium and blocks it, so a virtual X display is required when `$DISPLAY` is unset.
+```bash
+docker run -d --name=flaresolverr -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest
+```
+
+The default URL is `http://localhost:8191`. Override with the `FLARESOLVERR_URL` environment variable if needed.
 
 Open a terminal and run the following commands.
 
