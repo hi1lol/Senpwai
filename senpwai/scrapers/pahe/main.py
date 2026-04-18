@@ -3,6 +3,7 @@ import math
 from typing import Any, Callable, NamedTuple, cast
 from requests import Response
 from bs4 import BeautifulSoup, Tag
+from curl_cffi import requests as curl_requests
 from senpwai.common.scraper import (
     CLIENT,
     PARSER,
@@ -13,6 +14,7 @@ from senpwai.common.scraper import (
     get_new_home_url_from_readme,
     closest_quality_index,
 )
+from senpwai.scrapers.pahe.cf_bypass import get_kwik_session
 from senpwai.scrapers.pahe.constants import (
     CHAR_MAP_BASE,
     CHAR_MAP_DIGITS,
@@ -324,40 +326,66 @@ class GetDirectDownloadLinks(ProgressFunction):
         progress_update_callback: Callable[[int], None] | None = None,
     ) -> list[str]:
         direct_download_links: list[str] = []
-        for pahewin_link in pahewin_download_page_links:
-            # Extract kwik page links
-            pahewin_html_page = CLIENT.get(pahewin_link).text
-            kwik_page_link = cast(
-                re.Match[str], KWIK_PAGE_REGEX.search(pahewin_html_page)
-            ).group()
+        # kwik.cx sits behind a Cloudflare managed challenge. We solve it once
+        # with a real browser (see cf_bypass), cache the cookies + matching UA,
+        # and replay them via curl_cffi so the TLS fingerprint also matches a
+        # real Chrome — CF checks both.
+        cf = get_kwik_session()
+        kwik_session = curl_requests.Session(impersonate="chrome")
+        try:
+            kwik_session.headers["User-Agent"] = cf["user_agent"]
+            for name, value in cf["cookies"].items():
+                kwik_session.cookies.set(name, value, domain=".kwik.cx")
 
-            # Extract direct download links from kwik html page
-            response = CLIENT.get(kwik_page_link)
-            match = cast(re.Match, PARAM_REGEX.search(response.text))
-            full_key, key, v1, v2 = (
-                match.group(1),
-                match.group(2),
-                match.group(3),
-                match.group(4),
-            )
-            form = decrypt_post_form(full_key, key, int(v1), int(v2))
-            soup = BeautifulSoup(form, PARSER)
-            post_url = cast(str, cast(Tag, soup.form)["action"])
-            token_value = cast(str, cast(Tag, soup.input)["value"])
-            response = CLIENT.post(
-                post_url,
-                headers=CLIENT.make_headers({"Referer": kwik_page_link}),
-                cookies=response.cookies,
-                data={"_token": token_value},
-                allow_redirects=False,
-            )
-            direct_download_link = response.headers["Location"]
-            direct_download_links.append(direct_download_link)
-            self.resume.wait()
-            if self.cancelled:
-                return []
-            if progress_update_callback:
-                progress_update_callback(1)
+            for pahewin_link in pahewin_download_page_links:
+                # Extract kwik page links
+                pahewin_html_page = CLIENT.get(pahewin_link).text
+                kwik_page_link = cast(
+                    re.Match[str], KWIK_PAGE_REGEX.search(pahewin_html_page)
+                ).group()
+
+                # Extract direct download links from kwik html page
+                response = kwik_session.get(kwik_page_link)
+                match = PARAM_REGEX.search(response.text)
+                if match is None:
+                    # Clearance probably expired mid-run; refresh once and retry.
+                    cf = get_kwik_session(force_refresh=True)
+                    kwik_session.headers["User-Agent"] = cf["user_agent"]
+                    kwik_session.cookies.clear()
+                    for name, value in cf["cookies"].items():
+                        kwik_session.cookies.set(name, value, domain=".kwik.cx")
+                    response = kwik_session.get(kwik_page_link)
+                    match = PARAM_REGEX.search(response.text)
+                    if match is None:
+                        raise RuntimeError(
+                            f"Failed to extract kwik params from {kwik_page_link} "
+                            f"(status={response.status_code}) after refreshing CF clearance."
+                        )
+                full_key, key, v1, v2 = (
+                    match.group(1),
+                    match.group(2),
+                    match.group(3),
+                    match.group(4),
+                )
+                form = decrypt_post_form(full_key, key, int(v1), int(v2))
+                soup = BeautifulSoup(form, PARSER)
+                post_url = cast(str, cast(Tag, soup.form)["action"])
+                token_value = cast(str, cast(Tag, soup.input)["value"])
+                response = kwik_session.post(
+                    post_url,
+                    headers={"Referer": kwik_page_link},
+                    data={"_token": token_value},
+                    allow_redirects=False,
+                )
+                direct_download_link = response.headers["Location"]
+                direct_download_links.append(direct_download_link)
+                self.resume.wait()
+                if self.cancelled:
+                    return []
+                if progress_update_callback:
+                    progress_update_callback(1)
+        finally:
+            kwik_session.close()
         return direct_download_links
 
 

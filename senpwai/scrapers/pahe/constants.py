@@ -1,7 +1,7 @@
 import re
 
 PAHE = "pahe"
-PAHE_DOMAIN = "animepahe.si"
+PAHE_DOMAIN = "animepahe.pw"
 PAHE_HOME_URL = f"https://{PAHE_DOMAIN}"
 FULL_SITE_NAME = "Animepahe"
 API_ENTRY_POINT = f"{PAHE_HOME_URL}/api?m="
@@ -24,6 +24,7 @@ Generates the load episodes link from the provided anime page link and page numb
 Example: {anime_page_link}&page={page_number}
 """
 KWIK_PAGE_REGEX = re.compile(r"https?://kwik.cx/f/([^\"']+)")
+KWIK_REFERER = "https://kwik.cx/"
 DUB_PATTERN = "eng"
 
 EPISODE_SIZE_REGEX = re.compile(r"\b(\d+)MB\b")

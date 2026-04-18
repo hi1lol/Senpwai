@@ -425,6 +425,7 @@ class Download(ProgressFunction):
         is_hls_download=False,
         cookies=requests.sessions.RequestsCookieJar(),
         max_part_size=0,
+        referer: str | None = None,
     ) -> None:
         super().__init__()
         self.link_or_segment_urls = link_or_segment_urls
@@ -435,6 +436,7 @@ class Download(ProgressFunction):
         self.cookies = cookies
         self.update_lock = threading.Lock()
         self.max_part_size = max_part_size
+        self.referer = referer
         file_title = f"{self.episode_title}{file_extension}"
         self.file_path = os.path.join(self.download_folder_path, file_title)
         self.download_size = download_size
@@ -444,8 +446,9 @@ class Download(ProgressFunction):
         self.rm_temp_path()
 
     @staticmethod
-    def get_total_download_size(url: str) -> tuple[int, str]:
-        response = CLIENT.get(url, stream=True, allow_redirects=True)
+    def get_total_download_size(url: str, referer: str | None = None) -> tuple[int, str]:
+        headers = CLIENT.make_headers({"Referer": referer}) if referer else None
+        response = CLIENT.get(url, stream=True, allow_redirects=True, headers=headers)
         resource_length_str = response.headers.get("Content-Length", None)
         redirect_url = response.url
         if resource_length_str is None:
@@ -494,9 +497,12 @@ class Download(ProgressFunction):
                 pass
 
     def hls_download(self) -> None:
+        seg_headers = (
+            CLIENT.make_headers({"Referer": self.referer}) if self.referer else None
+        )
         with open(self.temp_path, "wb") as f:
             for seg in self.link_or_segment_urls:
-                response = CLIENT.get(seg)
+                response = CLIENT.get(seg, headers=seg_headers)
                 self.resume.wait()
                 if self.cancelled:
                     return
@@ -514,9 +520,10 @@ class Download(ProgressFunction):
             with open(temp_file_path, "ab" if is_retry else "wb") as file:
                 end_byte = start_byte + part_size - 1
                 self.link_or_segment_urls = cast(str, self.link_or_segment_urls)
-                headers = CLIENT.make_headers(
-                    {"Range": f"bytes={start_byte}-{end_byte}"}
-                )
+                added_headers = {"Range": f"bytes={start_byte}-{end_byte}"}
+                if self.referer:
+                    added_headers["Referer"] = self.referer
+                headers = CLIENT.make_headers(added_headers)
                 response = CLIENT.get(
                     self.link_or_segment_urls,
                     stream=True,

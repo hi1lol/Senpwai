@@ -783,7 +783,12 @@ class DownloadManagerThread(QThread, ProgressFunction):
                 (
                     episode_size_or_segs,
                     ddl_or_seg_urls,
-                ) = Download.get_total_download_size(cast(str, ddl_or_seg_urls))
+                ) = Download.get_total_download_size(
+                    cast(str, ddl_or_seg_urls),
+                    referer=pahe.KWIK_REFERER
+                    if self.anime_details.site == PAHE
+                    else None,
+                )
 
             # This is specifcally at this point instead of at the top cause of the above http request made in
             # self.get_exact_episode_size such that if a user pauses or cancels as the request is in progress the input will be captured
@@ -893,6 +898,7 @@ class DownloadThread(QThread):
             lambda x: self.update_bars.emit(x),
             is_hls_download=self.is_hls_download,
             max_part_size=max_part_size,
+            referer=pahe.KWIK_REFERER if self.site == PAHE else None,
         )
         self.progress_bar.pause_callback = self.download.pause_or_resume
         self.progress_bar.cancel_callback = self.cancel

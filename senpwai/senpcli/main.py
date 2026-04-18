@@ -423,6 +423,7 @@ def create_progress_bar(
     link_or_segs_urls: str | list[str],
     is_hls_download: bool,
     episode_size: int | None,
+    referer: str | None = None,
 ) -> tuple[ProgressBar, str | list[str]]:
     if is_hls_download:
         episode_size = len(link_or_segs_urls)
@@ -434,7 +435,7 @@ def create_progress_bar(
     else:
         if episode_size is None:
             episode_size, link_or_segs_urls = Download.get_total_download_size(
-                cast(str, link_or_segs_urls)
+                cast(str, link_or_segs_urls), referer=referer
             )
         pbar = ProgressBar(
             total=episode_size,
@@ -465,6 +466,7 @@ def download_thread(
         pbar.update_,
         is_hls_download=is_hls_download,
         max_part_size=max_part_size,
+        referer=pahe.KWIK_REFERER if anime_details.site == PAHE else None,
     )
     download.start_download()
     pbar.close_()
@@ -506,6 +508,7 @@ def download_manager(
         while not event.wait(0.1):
             pass
 
+    referer = pahe.KWIK_REFERER if anime_details.site == PAHE else None
     for idx, link in enumerate(ddls_or_segs_urls):
         wait(download_slot_available)
         shortened_episode_title = anime_details.episode_title(idx, True)
@@ -514,9 +517,11 @@ def download_manager(
         elif is_hls_download:
             download_size = len(link)
         else:
-            download_size, link = Download.get_total_download_size(cast(str, link))
+            download_size, link = Download.get_total_download_size(
+                cast(str, link), referer=referer
+            )
         pbar, link = create_progress_bar(
-            shortened_episode_title, link, is_hls_download, download_size
+            shortened_episode_title, link, is_hls_download, download_size, referer
         )
         episode_title = anime_details.episode_title(idx, False)
 

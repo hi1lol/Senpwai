@@ -52,6 +52,8 @@ tqdm = "^4.66.1"
 argparse = "^1.4.0"
 pylnk3 = "^0.4.2"
 pyqt6 = "^6.6.1"
+curl_cffi = ">=0.7,<0.14"
+nodriver = "^0.48"
 
 [tool.poetry.group.dev.dependencies]
 cx-freeze = "^6.15.12"
