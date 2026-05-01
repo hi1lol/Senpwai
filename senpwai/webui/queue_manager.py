@@ -116,6 +116,37 @@ class DownloadQueueManager:
         threading.Thread(target=self._run_job, args=(item,), daemon=True).start()
         return True
 
+    def start_all_sequential(self, job_ids: list[str]) -> int:
+        queued = [jid for jid in job_ids if (item := self.get(jid)) and item.status == "queued"]
+        if not queued:
+            return 0
+        threading.Thread(target=self._run_sequential, args=(queued,), daemon=True).start()
+        return len(queued)
+
+    def _run_sequential(self, job_ids: list[str]) -> None:
+        for job_id in job_ids:
+            item = self.get(job_id)
+            if item is None or item.status != "queued":
+                continue
+            self._run_job(item)
+
+    def retry(self, job_id: str) -> bool:
+        item = self.get(job_id)
+        if item is None or item.status != "failed":
+            return False
+        with item._lock:
+            item.status = "queued"
+            item.error_message = None
+            item.finished_at = None
+            item.episodes = []
+            item.resolve_step = ""
+            item.resolve_current = 0
+            item.resolve_total = 0
+            item._cancel_event.clear()
+        self._notify_subscribers(item.job_id)
+        threading.Thread(target=self._run_job, args=(item,), daemon=True).start()
+        return True
+
     def cancel(self, job_id: str) -> bool:
         item = self.get(job_id)
         if item is None:

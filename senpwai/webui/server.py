@@ -185,11 +185,17 @@ async def start_queue_item(job_id: str) -> dict:
 async def start_all_queue_items() -> dict:
     _require_queue()
     jobs = QUEUE_MANAGER.get_all()
-    started = 0
-    for j in jobs:
-        if j["status"] == "queued" and QUEUE_MANAGER.start(j["job_id"]):
-            started += 1
+    job_ids = [j["job_id"] for j in jobs if j["status"] == "queued"]
+    started = QUEUE_MANAGER.start_all_sequential(job_ids)
     return {"started": started}
+
+
+@app.post("/api/queue/{job_id}/retry")
+async def retry_queue_item(job_id: str) -> dict:
+    _require_queue()
+    if not QUEUE_MANAGER.retry(job_id):
+        raise HTTPException(status_code=400, detail="Job not found or not in failed state")
+    return {"ok": True}
 
 
 @app.delete("/api/queue/{job_id}")
