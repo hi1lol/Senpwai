@@ -3,15 +3,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import uuid
 import webbrowser
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+logging.basicConfig(level=logging.DEBUG)
+
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from senpwai.common.classes import SETTINGS, Anime, AnimeDetails
@@ -272,6 +275,33 @@ def _resolve_browser_download(req: BrowserDownloadRequest) -> list[dict]:
         _browser_dl_store[token] = {"url": url, "title": title}
         episodes.append({"token": token, "title": title})
     return episodes
+
+
+@app.get("/api/proxy-image")
+async def proxy_image(url: str) -> Response:
+    from urllib.parse import urlparse
+    from senpwai.scrapers.pahe.main import PAHE_SESSION
+    from senpwai.scrapers.pahe.cf_bypass import get_pahe_session
+    parsed = urlparse(url)
+    if not parsed.hostname or not (
+        parsed.hostname.endswith("animepahe.pw") or parsed.hostname.endswith("animepahe.ru")
+    ):
+        raise HTTPException(status_code=400, detail="URL not allowed")
+
+    def fetch() -> tuple[bytes, str]:
+        cf = get_pahe_session()
+        resp = PAHE_SESSION.get(
+            url,
+            cookies=cf["cookies"],
+            headers={"User-Agent": cf["user_agent"]},
+            allow_redirects=True,
+        )
+        resp.raise_for_status()
+        return resp.content, resp.headers.get("content-type", "image/jpeg")
+
+    loop = asyncio.get_running_loop()
+    content, content_type = await loop.run_in_executor(None, fetch)
+    return Response(content=content, media_type=content_type)
 
 
 @app.post("/api/browser-download/resolve")

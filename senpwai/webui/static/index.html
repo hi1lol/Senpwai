@@ -494,7 +494,7 @@ function renderDetails() {
   const d = state.details;
   document.getElementById('details-loading').classList.remove('visible');
 
-  document.getElementById('poster-img').src = d.poster_url || '';
+  document.getElementById('poster-img').src = d.poster_url ? `/api/proxy-image?url=${encodeURIComponent(d.poster_url)}` : '';
   document.getElementById('details-title').textContent = state.selected.title;
 
   const meta = [];

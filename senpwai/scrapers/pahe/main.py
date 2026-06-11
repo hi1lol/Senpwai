@@ -1,8 +1,10 @@
+import logging
 import re
 import math
 from typing import Any, Callable, NamedTuple, cast
-from requests import Response
 from bs4 import BeautifulSoup, Tag
+
+logger = logging.getLogger(__name__)
 from curl_cffi import requests as curl_requests
 from senpwai.common.scraper import (
     CLIENT,
@@ -14,7 +16,7 @@ from senpwai.common.scraper import (
     get_new_home_url_from_readme,
     closest_quality_index,
 )
-from senpwai.scrapers.pahe.cf_bypass import get_kwik_session
+from senpwai.scrapers.pahe.cf_bypass import get_kwik_session, get_pahe_session
 from senpwai.scrapers.pahe.constants import (
     CHAR_MAP_BASE,
     CHAR_MAP_DIGITS,
@@ -32,6 +34,7 @@ from senpwai.scrapers.pahe.constants import (
 
 FIRST_REQUEST = True
 COOKIES = {"__ddg1_": "", "__ddg2_": ""}
+PAHE_SESSION = curl_requests.Session(impersonate="chrome")
 """
 For some reason these cookies just need to be set as in they don't even need to be valid
 If something crashes, try updating to something like: 
@@ -43,36 +46,69 @@ Also it seems currently only __ddg2_ is necessary
 """
 
 
-def site_request(url: str, allow_redirects=False) -> Response:
+def site_request(url: str, allow_redirects=True):
     """
-    For requests that go specifically to the domain animepahe.ru instead of e.g., pahe.win or kwik.si
-    Typically these requests need the cookies
+    For requests that go specifically to the animepahe domain.
+    Uses FlareSolverr-obtained cf_clearance cookies + curl_cffi Chrome impersonation
+    to bypass Cloudflare's JS challenge.
     """
+    global FIRST_REQUEST, PAHE_HOME_URL
+    logger.debug("site_request: GET %s (allow_redirects=%s)", url, allow_redirects)
+
+    cf = get_pahe_session()
+    request_cookies = {**COOKIES, **cf["cookies"]}
+    request_headers = {"User-Agent": cf["user_agent"]}
+
     try:
-        # We only want to handle the domain change incase this is the first request
-        # This is to avoid raising DomainNameError when the something else broke instead
-        global FIRST_REQUEST
         if FIRST_REQUEST:
             FIRST_REQUEST = False
-            response = CLIENT.get(
-                url,
-                cookies=COOKIES,
-                allow_redirects=allow_redirects,
-                exceptions_to_raise=(DomainNameError, KeyboardInterrupt),
-            )
+            try:
+                response = PAHE_SESSION.get(
+                    url,
+                    cookies=request_cookies,
+                    headers=request_headers,
+                    allow_redirects=allow_redirects,
+                )
+            except Exception as e:
+                if has_valid_internet_connection():
+                    raise DomainNameError(e)
+                raise
         else:
-            response = CLIENT.get(url, cookies=COOKIES, allow_redirects=allow_redirects)
-        COOKIES.update(response.cookies)
+            response = PAHE_SESSION.get(
+                url,
+                cookies=request_cookies,
+                headers=request_headers,
+                allow_redirects=allow_redirects,
+            )
+        COOKIES.update(dict(response.cookies))
     except DomainNameError:
-        global PAHE_HOME_URL
         PAHE_HOME_URL = get_new_home_url_from_readme(FULL_SITE_NAME)
         return site_request(url)
+
+    logger.debug(
+        "site_request: status=%s url=%s content-type=%s body[:300]=%r",
+        response.status_code,
+        response.url,
+        response.headers.get("content-type", "?"),
+        response.content[:300],
+    )
+
+    if response.status_code == 403 and b"Just a moment" in response.content:
+        logger.warning("Cloudflare challenge still active — forcing FlareSolverr refresh")
+        get_pahe_session(force_refresh=True)
+        return site_request(url)
+
     return response
 
 
 def search(keyword: str) -> list[dict[str, str]]:
     search_url = f"{API_ENTRY_POINT}search&q={keyword}"
     response = site_request(search_url)
+    if not response.content:
+        raise RuntimeError(
+            f"Empty response from Animepahe search (HTTP {response.status_code}). "
+            "The site may be down or the domain may have changed."
+        )
     results_json = cast(dict, response.json())
     # The search api endpoint won't return json containing the data key if no results are found
     return results_json.get("data", [])
