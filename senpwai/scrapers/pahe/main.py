@@ -1,11 +1,12 @@
 import logging
 import re
 import math
+import time
 from typing import Any, Callable, NamedTuple, cast
 from bs4 import BeautifulSoup, Tag
+from curl_cffi import requests as curl_requests
 
 logger = logging.getLogger(__name__)
-from curl_cffi import requests as curl_requests
 from senpwai.common.scraper import (
     CLIENT,
     PARSER,
@@ -14,6 +15,7 @@ from senpwai.common.scraper import (
     DomainNameError,
     ProgressFunction,
     get_new_home_url_from_readme,
+    has_valid_internet_connection,
     closest_quality_index,
 )
 from senpwai.scrapers.pahe.cf_bypass import get_kwik_session, get_pahe_session
@@ -46,11 +48,19 @@ Also it seems currently only __ddg2_ is necessary
 """
 
 
-def site_request(url: str, allow_redirects=True):
+MAX_RATE_LIMIT_RETRIES = 6
+RATE_LIMIT_BACKOFF_SECONDS = 5
+# Episode-page (pahewin) fetching: proactive throttle + retry on empty results
+PAHEWIN_REQUEST_DELAY_SECONDS = 1
+MAX_EMPTY_PAGE_RETRIES = 3
+EMPTY_PAGE_BACKOFF_SECONDS = 4
+
+
+def site_request(url: str, allow_redirects=True, _rate_limit_retries=0):
     """
     For requests that go specifically to the animepahe domain.
     Uses FlareSolverr-obtained cf_clearance cookies + curl_cffi Chrome impersonation
-    to bypass Cloudflare's JS challenge.
+    to bypass Cloudflare's JS challenge. Retries with backoff on HTTP 429 (rate limit).
     """
     global FIRST_REQUEST, PAHE_HOME_URL
     logger.debug("site_request: GET %s (allow_redirects=%s)", url, allow_redirects)
@@ -96,7 +106,19 @@ def site_request(url: str, allow_redirects=True):
     if response.status_code == 403 and b"Just a moment" in response.content:
         logger.warning("Cloudflare challenge still active — forcing FlareSolverr refresh")
         get_pahe_session(force_refresh=True)
-        return site_request(url)
+        return site_request(url, allow_redirects)
+
+    # Animepahe rate-limits rapid sequential requests with HTTP 429.
+    # Back off and retry instead of letting the caller silently drop the episode.
+    if response.status_code == 429:
+        if _rate_limit_retries >= MAX_RATE_LIMIT_RETRIES:
+            logger.error("Rate limited (429) on %s after %d retries — giving up", url, _rate_limit_retries)
+            return response
+        retry_after = response.headers.get("retry-after")
+        wait = int(retry_after) if retry_after and retry_after.isdigit() else RATE_LIMIT_BACKOFF_SECONDS * (_rate_limit_retries + 1)
+        logger.warning("Rate limited (429) on %s — waiting %ss then retrying (attempt %d)", url, wait, _rate_limit_retries + 1)
+        time.sleep(wait)
+        return site_request(url, allow_redirects, _rate_limit_retries + 1)
 
     return response
 
@@ -233,6 +255,31 @@ class GetPahewinPageLinks(ProgressFunction):
     def __init__(self) -> None:
         super().__init__()
 
+    def _fetch_pahewin_data(self, episode_page_link: str):
+        """Fetch an episode page and extract its download dropdown links.
+
+        Retries on an empty result — animepahe intermittently rate-limits (HTTP 429)
+        or serves a Cloudflare challenge during rapid batch fetches. Returns the
+        BeautifulSoup ``find_all`` result (empty list if it genuinely has no links).
+        """
+        for attempt in range(MAX_EMPTY_PAGE_RETRIES + 1):
+            page_content = site_request(episode_page_link, allow_redirects=True).content
+            soup = BeautifulSoup(page_content, PARSER)
+            pahewin_data = soup.find_all("a", class_="dropdown-item", target="_blank")
+            if pahewin_data:
+                return pahewin_data
+            if b"Just a moment" in page_content:
+                logger.warning("CF challenge on %s — refreshing session", episode_page_link)
+                get_pahe_session(force_refresh=True)
+            if attempt < MAX_EMPTY_PAGE_RETRIES:
+                wait = EMPTY_PAGE_BACKOFF_SECONDS * (attempt + 1)
+                logger.warning(
+                    "No download links on %s (attempt %d) — waiting %ss then retrying",
+                    episode_page_link, attempt + 1, wait,
+                )
+                time.sleep(wait)
+        return []
+
     def get_pahewin_page_links_and_info(
         self,
         episode_page_links: list[str],
@@ -241,15 +288,17 @@ class GetPahewinPageLinks(ProgressFunction):
         pahewin_links: list[list[str]] = []
         download_info: list[list[str]] = []
         for episode_page_link in episode_page_links:
-            page_content = site_request(episode_page_link, allow_redirects=True).content
-            soup = BeautifulSoup(page_content, PARSER)
-            pahewin_data = soup.find_all("a", class_="dropdown-item", target="_blank")
+            pahewin_data = self._fetch_pahewin_data(episode_page_link)
             if pahewin_data:
                 pahewin_links.append([cast(str, link["href"]) for link in pahewin_data])
                 download_info.append([li.text.strip() for li in pahewin_data])
+            else:
+                logger.error("No download links found for %s after retries — skipping", episode_page_link)
             self.resume.wait()
             if self.cancelled:
                 return ([], [])
+            # Small proactive throttle to stay under animepahe's rate limit.
+            time.sleep(PAHEWIN_REQUEST_DELAY_SECONDS)
             if progress_update_callback:
                 progress_update_callback(1)
         return (pahewin_links, download_info)

@@ -280,7 +280,7 @@ def _resolve_browser_download(req: BrowserDownloadRequest) -> list[dict]:
 @app.get("/api/proxy-image")
 async def proxy_image(url: str) -> Response:
     from urllib.parse import urlparse
-    from senpwai.scrapers.pahe.main import PAHE_SESSION
+    from curl_cffi import requests as curl_requests
     from senpwai.scrapers.pahe.cf_bypass import get_pahe_session
     parsed = urlparse(url)
     if not parsed.hostname or not (
@@ -289,15 +289,20 @@ async def proxy_image(url: str) -> Response:
         raise HTTPException(status_code=400, detail="URL not allowed")
 
     def fetch() -> tuple[bytes, str]:
+        # cf_clearance has domain .animepahe.pw, so the main session cookies
+        # also cover the i.animepahe.pw image CDN.
+        # Use a fresh session (not the shared PAHE_SESSION) so its accumulated
+        # cookie jar doesn't override the fresh cf_clearance we pass in.
         cf = get_pahe_session()
-        resp = PAHE_SESSION.get(
-            url,
-            cookies=cf["cookies"],
-            headers={"User-Agent": cf["user_agent"]},
-            allow_redirects=True,
-        )
-        resp.raise_for_status()
-        return resp.content, resp.headers.get("content-type", "image/jpeg")
+        with curl_requests.Session(impersonate="chrome") as s:
+            resp = s.get(
+                url,
+                cookies=cf["cookies"],
+                headers={"User-Agent": cf["user_agent"], "Referer": "https://animepahe.pw/"},
+                allow_redirects=True,
+            )
+            resp.raise_for_status()
+            return resp.content, resp.headers.get("content-type", "image/jpeg")
 
     loop = asyncio.get_running_loop()
     content, content_type = await loop.run_in_executor(None, fetch)
