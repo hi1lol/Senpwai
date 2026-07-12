@@ -12,6 +12,8 @@ from typing import Callable, Iterator, TypeVar, cast
 from webbrowser import open_new_tab
 
 import requests
+from curl_cffi import requests as curl_requests
+from curl_cffi.requests.exceptions import RequestException as CurlRequestException
 
 from senpwai.common.static import OS, log_exception, try_deleting
 
@@ -149,20 +151,38 @@ class Client:
         allow_redirects=False,
         timeout: int | None = None,
         exceptions_to_raise: tuple[type[BaseException], ...] = (KeyboardInterrupt,),
+        impersonate: str | None = None,
     ) -> requests.Response:
-        if not headers:
+        if not headers and not impersonate:
             headers = self.headers
         if method == "GET":
+            if impersonate:
+                # Some CDNs (e.g. animepahe's owocdn vaults) sit behind Cloudflare,
+                # which blocks plain-requests' TLS fingerprint with a 403. curl_cffi
+                # impersonates a real browser's fingerprint so the request is allowed.
+                # We deliberately don't inject our random User-Agent here so the whole
+                # fingerprint stays consistent with the impersonated browser.
+                def callback():
+                    return curl_requests.get(
+                        url,
+                        headers=headers,
+                        stream=stream,
+                        cookies=cookies,
+                        allow_redirects=allow_redirects,
+                        timeout=timeout,
+                        impersonate=impersonate,
+                    )
+            else:
 
-            def callback():
-                return requests.get(
-                    url,
-                    headers=headers,
-                    stream=stream,
-                    cookies=cookies,
-                    allow_redirects=allow_redirects,
-                    timeout=timeout,
-                )
+                def callback():
+                    return requests.get(
+                        url,
+                        headers=headers,
+                        stream=stream,
+                        cookies=cookies,
+                        allow_redirects=allow_redirects,
+                        timeout=timeout,
+                    )
         else:
 
             def callback():
@@ -186,6 +206,7 @@ class Client:
         cookies={},
         allow_redirects=False,
         exceptions_to_raise: tuple[type[BaseException], ...] = (KeyboardInterrupt,),
+        impersonate: str | None = None,
     ) -> requests.Response:
         return self.make_request(
             "GET",
@@ -196,6 +217,7 @@ class Client:
             cookies=cookies,
             exceptions_to_raise=exceptions_to_raise,
             allow_redirects=allow_redirects,
+            impersonate=impersonate,
         )
 
     def post(
@@ -227,7 +249,7 @@ class Client:
         while True:
             try:
                 return callback()
-            except requests.exceptions.RequestException as e:
+            except (requests.exceptions.RequestException, CurlRequestException) as e:
                 if isinstance(e, KeyboardInterrupt):
                     raise
                 if (
@@ -447,13 +469,43 @@ class Download(ProgressFunction):
 
     @staticmethod
     def get_total_download_size(url: str, referer: str | None = None) -> tuple[int, str]:
-        headers = CLIENT.make_headers({"Referer": referer}) if referer else None
-        response = CLIENT.get(url, stream=True, allow_redirects=True, headers=headers)
-        resource_length_str = response.headers.get("Content-Length", None)
+        # A referer signals a Cloudflare-protected CDN (animepahe's kwik/owocdn),
+        # which 403s plain requests — use the passed referer + browser impersonation.
+        # For those the referer must be sent verbatim (hotlink protection) so we skip
+        # make_headers' random User-Agent injection to keep the fingerprint consistent.
+        impersonate = "chrome" if referer else None
+        headers = {"Referer": referer} if referer else None
+        response = CLIENT.get(
+            url,
+            stream=True,
+            allow_redirects=True,
+            headers=headers,
+            impersonate=impersonate,
+        )
         redirect_url = response.url
-        if resource_length_str is None:
-            raise NoResourceLengthException(url, redirect_url)
-        return (int(resource_length_str), redirect_url)
+        resource_length_str = response.headers.get("Content-Length", None)
+        if resource_length_str is not None:
+            return (int(resource_length_str), redirect_url)
+        # Some CDNs stream the full response with chunked transfer-encoding and omit
+        # Content-Length. Since the downloader fetches via byte-range requests anyway,
+        # ask for a single byte and read the total from the Content-Range header:
+        # "bytes 0-0/<total>".
+        range_added = {"Range": "bytes=0-0"}
+        if referer:
+            range_added["Referer"] = referer
+        range_response = CLIENT.get(
+            redirect_url,
+            stream=True,
+            allow_redirects=True,
+            headers=range_added if impersonate else CLIENT.make_headers(range_added),
+            impersonate=impersonate,
+        )
+        content_range = range_response.headers.get("Content-Range", None)
+        if content_range and "/" in content_range:
+            total = content_range.rsplit("/", 1)[-1].strip()
+            if total.isdigit():
+                return (int(total), redirect_url)
+        raise NoResourceLengthException(url, redirect_url)
 
     def cancel(self):
         return super().cancel()
@@ -523,13 +575,17 @@ class Download(ProgressFunction):
                 added_headers = {"Range": f"bytes={start_byte}-{end_byte}"}
                 if self.referer:
                     added_headers["Referer"] = self.referer
-                headers = CLIENT.make_headers(added_headers)
+                # A referer signals a Cloudflare-protected CDN (kwik/owocdn) that 403s
+                # plain requests; impersonate a browser and send the referer verbatim.
+                impersonate = "chrome" if self.referer else None
+                headers = added_headers if impersonate else CLIENT.make_headers(added_headers)
                 response = CLIENT.get(
                     self.link_or_segment_urls,
                     stream=True,
                     headers=headers,
                     timeout=30,
                     cookies=self.cookies,
+                    impersonate=impersonate,
                 )
                 iter_content = cast(
                     Iterator[bytes],

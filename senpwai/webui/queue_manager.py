@@ -8,7 +8,7 @@ from typing import Callable
 
 from senpwai.common.classes import SETTINGS, Anime, AnimeDetails, get_max_part_size
 from senpwai.common.scraper import Download
-from senpwai.common.static import DUB, GOGO, PAHE
+from senpwai.common.static import DUB, GOGO, PAHE, log_exception
 from senpwai.scrapers import gogo, pahe
 
 
@@ -18,6 +18,7 @@ class EpisodeProgress:
         self.status = "pending"  # pending | downloading | done | failed
         self.downloaded_bytes = 0
         self.total_bytes = total_bytes
+        self.error: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -25,6 +26,7 @@ class EpisodeProgress:
             "status": self.status,
             "downloaded_bytes": self.downloaded_bytes,
             "total_bytes": self.total_bytes,
+            "error": self.error,
         }
 
 
@@ -403,41 +405,56 @@ class DownloadQueueManager:
             ]
         self._notify_subscribers(item.job_id)
 
+        failures: list[tuple[int, str]] = []
+        failures_lock = threading.Lock()
+
         def ep_thread(idx: int, link: str | list[str]) -> None:
             with sem:
                 if item._cancel_event.is_set():
                     return
 
-                if download_sizes:
-                    size = download_sizes[idx]
-                elif is_hls:
-                    size = len(link)  # type: ignore[arg-type]
-                else:
-                    size, link = Download.get_total_download_size(  # type: ignore[assignment]
-                        link, referer=referer  # type: ignore[arg-type]
+                try:
+                    if download_sizes:
+                        size = download_sizes[idx]
+                    elif is_hls:
+                        size = len(link)  # type: ignore[arg-type]
+                    else:
+                        size, link = Download.get_total_download_size(  # type: ignore[assignment]
+                            link, referer=referer  # type: ignore[arg-type]
+                        )
+
+                    with item._lock:
+                        item.episodes[idx].total_bytes = size
+                        item.episodes[idx].status = "downloading"
+                    self._notify_subscribers(item.job_id)
+
+                    max_part_size = get_max_part_size(size, item.site, is_hls)
+                    dl = Download(
+                        link,
+                        anime_details.episode_title(idx, False),
+                        anime_details.anime_folder_path,
+                        size,
+                        self._make_progress_callback(item, idx),
+                        is_hls_download=is_hls,
+                        max_part_size=max_part_size,
+                        referer=referer,
                     )
+                    dl.start_download()
 
-                with item._lock:
-                    item.episodes[idx].total_bytes = size
-                    item.episodes[idx].status = "downloading"
-                self._notify_subscribers(item.job_id)
-
-                max_part_size = get_max_part_size(size, item.site, is_hls)
-                dl = Download(
-                    link,
-                    anime_details.episode_title(idx, False),
-                    anime_details.anime_folder_path,
-                    size,
-                    self._make_progress_callback(item, idx),
-                    is_hls_download=is_hls,
-                    max_part_size=max_part_size,
-                    referer=referer,
-                )
-                dl.start_download()
-
-                with item._lock:
-                    item.episodes[idx].status = "done"
-                self._notify_subscribers(item.job_id)
+                    with item._lock:
+                        item.episodes[idx].status = "done"
+                    self._notify_subscribers(item.job_id)
+                except Exception as e:
+                    # Don't let a single episode's failure crash its (daemon) thread
+                    # silently — record it so the job can report the failure instead
+                    # of falsely completing.
+                    log_exception(e)
+                    with item._lock:
+                        item.episodes[idx].status = "failed"
+                        item.episodes[idx].error = str(e)
+                    with failures_lock:
+                        failures.append((idx, str(e)))
+                    self._notify_subscribers(item.job_id)
 
         threads = [
             threading.Thread(target=ep_thread, args=(i, link), daemon=True)
@@ -447,6 +464,14 @@ class DownloadQueueManager:
             t.start()
         for t in threads:
             t.join()
+
+        if failures and not item._cancel_event.is_set():
+            titles = ", ".join(
+                anime_details.episode_title(idx, True) for idx, _ in sorted(failures)
+            )
+            raise RuntimeError(
+                f"Failed to download {len(failures)} episode(s): {titles}"
+            )
 
     def _make_progress_callback(self, item: QueueItem, ep_idx: int) -> Callable[[int], None]:
         last_notify: list[float] = [0.0]
