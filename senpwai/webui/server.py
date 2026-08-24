@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import threading
+import time
 import uuid
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -28,6 +32,11 @@ BROWSER_ONLY: bool = os.environ.get("SENPWEB_BROWSER_ONLY", "").strip() in ("1",
 
 # token -> {"url": str, "title": str}
 _browser_dl_store: dict[str, dict] = {}
+
+# Thumbnails in the search results mean a burst of image fetches per search. Give them
+# their own bounded pool so they can't starve searches, detail lookups and downloads,
+# which all share the default executor.
+_image_executor = ThreadPoolExecutor(max_workers=6, thread_name_prefix="img")
 
 
 @asynccontextmanager
@@ -84,14 +93,23 @@ async def patch_settings(body: SettingsPatch) -> dict:
 
 def _do_search(q: str, site: str) -> list[dict]:
     if site == PAHE:
-        return [
-            {"title": title, "page_link": page_link, "anime_id": anime_id}
-            for title, page_link, anime_id in (
-                pahe.extract_anime_title_page_link_and_id(r) for r in pahe.search(q)
+        results = []
+        for r in pahe.search(q):
+            title, page_link, anime_id = pahe.extract_anime_title_page_link_and_id(r)
+            results.append(
+                {
+                    "title": title,
+                    "page_link": page_link,
+                    "anime_id": anime_id,
+                    "poster": pahe.extract_poster_url(r),
+                }
             )
-        ]
+        return results
     results = gogo.search(q)
-    return [{"title": title, "page_link": link, "anime_id": None} for title, link in results]
+    return [
+        {"title": title, "page_link": link, "anime_id": None, "poster": ""}
+        for title, link in results
+    ]
 
 
 @app.get("/api/search")
@@ -111,9 +129,43 @@ class AnimeDetailsRequest(BaseModel):
     site: str
 
 
+# Building AnimeDetails costs two animepahe round-trips, so clicking back and forth
+# between results re-scrapes the same anime. Cache the built object; everything it
+# exposes here is either immutable metadata or re-derivable from disk without network.
+_DETAILS_TTL_SECONDS = 15 * 60
+_DETAILS_CACHE_MAX = 64
+# key -> (cached_at, AnimeDetails). Written from executor threads, so guard it.
+_details_cache: dict[tuple[str, str], tuple[float, AnimeDetails]] = {}
+_details_cache_lock = threading.Lock()
+
+
+def _get_anime_details(req: AnimeDetailsRequest) -> AnimeDetails:
+    key = (req.site, req.anime_id or req.page_link)
+    now = time.time()
+    with _details_cache_lock:
+        entry = _details_cache.get(key)
+        if entry is not None:
+            cached_at, details = entry
+            if now - cached_at < _DETAILS_TTL_SECONDS:
+                # Which episodes are already on disk can have changed since we cached
+                # (a download finished), so re-derive it. This re-globs the folder
+                # and touches no network.
+                details.set_anime_folder_path(details.get_anime_folder_path())
+                return details
+            del _details_cache[key]
+
+    details = AnimeDetails(Anime(req.title, req.page_link, req.anime_id), req.site)
+
+    with _details_cache_lock:
+        if len(_details_cache) >= _DETAILS_CACHE_MAX:
+            oldest = min(_details_cache, key=lambda k: _details_cache[k][0])
+            del _details_cache[oldest]
+        _details_cache[key] = (time.time(), details)
+    return details
+
+
 def _fetch_anime_details(req: AnimeDetailsRequest) -> dict:
-    anime = Anime(req.title, req.page_link, req.anime_id)
-    details = AnimeDetails(anime, req.site)
+    details = _get_anime_details(req)
     return {
         "episode_count": details.metadata.episode_count,
         "dub_available": details.dub_available,
@@ -278,7 +330,7 @@ def _resolve_browser_download(req: BrowserDownloadRequest) -> list[dict]:
 
 
 @app.get("/api/proxy-image")
-async def proxy_image(url: str) -> Response:
+async def proxy_image(url: str, request: Request) -> Response:
     from urllib.parse import urlparse
     from curl_cffi import requests as curl_requests
     from senpwai.scrapers.pahe.cf_bypass import get_pahe_session
@@ -287,6 +339,12 @@ async def proxy_image(url: str) -> Response:
         parsed.hostname.endswith("animepahe.pw") or parsed.hostname.endswith("animepahe.ru")
     ):
         raise HTTPException(status_code=400, detail="URL not allowed")
+
+    # Posters are content addressed upstream, so the url alone identifies the bytes.
+    etag = f'"{hashlib.sha1(url.encode()).hexdigest()}"'
+    cache_headers = {"Cache-Control": "public, max-age=86400", "ETag": etag}
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=cache_headers)
 
     def fetch() -> tuple[bytes, str]:
         # cf_clearance has domain .animepahe.pw, so the main session cookies
@@ -300,13 +358,20 @@ async def proxy_image(url: str) -> Response:
                 cookies=cf["cookies"],
                 headers={"User-Agent": cf["user_agent"], "Referer": "https://animepahe.pw/"},
                 allow_redirects=True,
+                timeout=(10, 30),
             )
             resp.raise_for_status()
             return resp.content, resp.headers.get("content-type", "image/jpeg")
 
     loop = asyncio.get_running_loop()
-    content, content_type = await loop.run_in_executor(None, fetch)
-    return Response(content=content, media_type=content_type)
+    try:
+        content, content_type = await loop.run_in_executor(_image_executor, fetch)
+    except Exception:
+        # A thumbnail that won't load is not a server failure; let the page render
+        # without it instead of surfacing a 500 per missing image.
+        logging.warning("proxy-image failed for %s", url, exc_info=True)
+        return Response(status_code=404, headers={"Cache-Control": "no-store"})
+    return Response(content=content, media_type=content_type, headers=cache_headers)
 
 
 @app.post("/api/browser-download/resolve")

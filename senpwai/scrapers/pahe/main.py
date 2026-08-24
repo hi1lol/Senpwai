@@ -145,6 +145,16 @@ def extract_anime_title_page_link_and_id(
     return title, page_link, anime_id
 
 
+def extract_poster_url(result: dict[str, str]) -> str:
+    """Poster thumbnail straight out of the search response.
+
+    The search api already returns this, so showing thumbnails in a result list costs
+    no extra requests. Optional on purpose: if the api ever drops the key we render
+    the list without images rather than failing the whole search.
+    """
+    return result.get("poster") or ""
+
+
 class EpisodePagesInfo(NamedTuple):
     start_page_num: int
     end_page_num: int

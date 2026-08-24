@@ -69,9 +69,17 @@
     .result-item {
       background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
       padding: 8px 12px; cursor: pointer; transition: border-color .15s;
+      display: flex; align-items: center; gap: 10px;
     }
     .result-item:hover { border-color: var(--primary); }
     .result-item.selected { border-color: var(--primary); background: #1e1040; }
+    /* Fixed box so rows don't jump as thumbnails stream in, and so rows without a
+       poster stay aligned with the ones that have one. */
+    .result-thumb {
+      flex: 0 0 auto; width: 40px; height: 56px; border-radius: 4px;
+      object-fit: cover; background: var(--border);
+    }
+    .result-title { min-width: 0; overflow-wrap: anywhere; }
 
     /* Anime details panel */
     #details-panel { display: none; }
@@ -439,7 +447,13 @@ function renderResults() {
     return;
   }
   el.innerHTML = state.results.map((r, i) =>
-    `<div class="result-item" onclick="selectAnime(${i})">${escHtml(r.title)}</div>`
+    `<div class="result-item" onclick="selectAnime(${i})">${
+       r.poster
+         ? `<img class="result-thumb" loading="lazy" decoding="async" alt=""
+                onerror="this.style.visibility='hidden'"
+                src="/api/proxy-image?url=${encodeURIComponent(r.poster)}">`
+         : `<div class="result-thumb"></div>`
+     }<span class="result-title">${escHtml(r.title)}</span></div>`
   ).join('');
 }
 
