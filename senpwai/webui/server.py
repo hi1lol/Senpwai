@@ -10,6 +10,7 @@ import threading
 import time
 import uuid
 import webbrowser
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -24,6 +25,7 @@ from pydantic import BaseModel
 from senpwai.common.classes import SETTINGS, Anime, AnimeDetails
 from senpwai.common.scraper import CLIENT
 from senpwai.common.static import DUB, GOGO, PAHE
+from senpwai.common.tracker import check_tracked_anime
 from senpwai.scrapers import gogo, pahe
 from senpwai.webui.queue_manager import QUEUE_MANAGER, QueueItem
 
@@ -38,11 +40,63 @@ _browser_dl_store: dict[str, dict] = {}
 # which all share the default executor.
 _image_executor = ThreadPoolExecutor(max_workers=6, thread_name_prefix="img")
 
+# Recent tracking-check outcomes, newest last, for the webui's tracking panel.
+_tracking_events: deque[dict] = deque(maxlen=30)
+_tracking_events_lock = threading.Lock()
+
+
+def _add_tracking_event(kind: str, message: str) -> None:
+    with _tracking_events_lock:
+        _tracking_events.append({"time": time.time(), "kind": kind, "message": message})
+
+
+def _run_tracking_check() -> None:
+    def start_download(anime_details: AnimeDetails) -> None:
+        item = QueueItem(
+            job_id=uuid.uuid4().hex,
+            anime_title=anime_details.anime.title,
+            page_link=anime_details.anime.page_link,
+            anime_id=anime_details.anime.id,
+            site=anime_details.site,
+            start_episode=anime_details.lacked_episodes[0],
+            end_episode=anime_details.lacked_episodes[-1],
+            quality=SETTINGS.quality,
+            sub_or_dub=SETTINGS.sub_or_dub,
+            hls_mode=anime_details.is_hls_download,
+        )
+        QUEUE_MANAGER.enqueue(item)
+        QUEUE_MANAGER.start(item.job_id)
+
+    check_tracked_anime(
+        removed_tracked_callback=SETTINGS.remove_tracked_anime,
+        finished_tracking_callback=lambda title: _add_tracking_event(
+            "finished", f"{title} has finished airing and was removed from tracking"
+        ),
+        no_dub_callback=lambda title: _add_tracking_event(
+            "no_dub", f"Failed to find dub for {title}"
+        ),
+        start_download_callback=start_download,
+        queued_new_episodes_callback=lambda titles: _add_tracking_event(
+            "queued", f"Queued new episodes for {titles}"
+        ),
+        start_downloading_immediately=True,
+    )
+
+
+async def _tracking_scheduler_loop() -> None:
+    loop = asyncio.get_running_loop()
+    while True:
+        await asyncio.sleep(SETTINGS.tracking_interval_hrs * 3600)
+        if SETTINGS.tracked_anime:
+            await loop.run_in_executor(None, _run_tracking_check)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     QUEUE_MANAGER.set_event_loop(asyncio.get_running_loop())
+    scheduler_task = asyncio.create_task(_tracking_scheduler_loop())
     yield
+    scheduler_task.cancel()
 
 
 app = FastAPI(title="Senpweb", lifespan=lifespan)
@@ -64,6 +118,7 @@ async def get_settings() -> dict:
         "max_simultaneous_downloads": SETTINGS.max_simultaneous_downloads,
         "gogo_mode": SETTINGS.gogo_mode,
         "tracking_site": SETTINGS.tracking_site,
+        "tracking_interval_hrs": SETTINGS.tracking_interval_hrs,
         "download_folder_paths": SETTINGS.download_folder_paths,
         "browser_only": BROWSER_ONLY,
     }
@@ -74,6 +129,7 @@ class SettingsPatch(BaseModel):
     sub_or_dub: str | None = None
     max_simultaneous_downloads: int | None = None
     gogo_mode: str | None = None
+    tracking_interval_hrs: int | None = None
 
 
 @app.patch("/api/settings")
@@ -86,7 +142,52 @@ async def patch_settings(body: SettingsPatch) -> dict:
         SETTINGS.update_max_simultaneous_downloads(body.max_simultaneous_downloads)
     if body.gogo_mode is not None:
         SETTINGS.update_gogo_mode(body.gogo_mode)
+    if body.tracking_interval_hrs is not None:
+        SETTINGS.update_tracking_interval_hrs(body.tracking_interval_hrs)
     return {"ok": True}
+
+
+# --- Tracking ---
+
+class TrackingRequest(BaseModel):
+    title: str
+
+
+@app.get("/api/tracking")
+async def get_tracking() -> dict:
+    with _tracking_events_lock:
+        events = list(_tracking_events)
+    return {
+        "tracked_anime": SETTINGS.tracked_anime,
+        "tracking_site": SETTINGS.tracking_site,
+        "tracking_interval_hrs": SETTINGS.tracking_interval_hrs,
+        "events": events,
+    }
+
+
+@app.post("/api/tracking")
+async def add_tracking(req: TrackingRequest) -> dict:
+    if req.title in SETTINGS.tracked_anime:
+        raise HTTPException(status_code=400, detail="Already tracking this anime")
+    SETTINGS.add_tracked_anime(req.title)
+    return {"ok": True}
+
+
+@app.delete("/api/tracking/{title}")
+async def remove_tracking(title: str) -> dict:
+    if title not in SETTINGS.tracked_anime:
+        raise HTTPException(status_code=404, detail="Not tracking this anime")
+    SETTINGS.remove_tracked_anime(title)
+    return {"ok": True}
+
+
+@app.post("/api/tracking/check")
+async def check_tracking_now() -> dict:
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _run_tracking_check)
+    with _tracking_events_lock:
+        events = list(_tracking_events)
+    return {"ok": True, "events": events}
 
 
 # --- Search ---
@@ -400,8 +501,21 @@ async def browser_download_file(token: str) -> StreamingResponse:
         raise HTTPException(status_code=404, detail="Token not found or expired")
 
     def stream():
-        headers = CLIENT.make_headers({"Referer": pahe.KWIK_REFERER})
-        resp = CLIENT.get(info["url"], stream=True, headers=headers, allow_redirects=True)
+        # info["url"] is still a pahe.win page link (resolve was deferred just-in-time,
+        # see the comment in queue_manager._resolve_pahe) — resolve it to the actual
+        # owocdn/kwik direct link now, right before streaming, the same way
+        # queue_manager.ep_thread does for server-side queue downloads.
+        direct_url = pahe.GetDirectDownloadLinks().resolve_one(info["url"])
+        # owocdn/kwik sit behind Cloudflare, which 403s plain requests — send the
+        # referer verbatim and impersonate a real browser's TLS fingerprint via
+        # curl_cffi, same as Download.get_total_download_size does.
+        resp = CLIENT.get(
+            direct_url,
+            stream=True,
+            allow_redirects=True,
+            headers={"Referer": pahe.KWIK_REFERER},
+            impersonate="chrome",
+        )
         for chunk in resp.iter_content(chunk_size=1024 * 1024):
             yield chunk
 

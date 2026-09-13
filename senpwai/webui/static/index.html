@@ -254,6 +254,7 @@
         <div class="dl-field" style="flex-direction:row;align-items:center;gap:8px;margin-left:auto">
           <button class="btn-primary" onclick="addToQueue()" id="add-btn">Add to Queue</button>
           <button class="btn-ghost" onclick="browserDownload()" id="browser-dl-btn">⬇ Download to Browser</button>
+          <button class="btn-ghost" onclick="trackCurrentAnime()" id="track-btn">☆ Track this anime</button>
         </div>
       </div>
     </div>
@@ -268,6 +269,23 @@
     <div id="queue-empty" class="visible">No downloads yet.</div>
     <div id="queue-list"></div>
   </div>
+
+  <!-- Tracking -->
+  <details open>
+    <summary>Tracking</summary>
+    <div class="card">
+      <div style="font-size:12px;color:var(--muted);margin-bottom:8px">
+        Tracked anime are checked for new episodes every <span id="track-interval-label">24</span>h and
+        auto-downloaded until they finish airing.
+      </div>
+      <div id="tracking-empty" style="color:var(--muted);font-size:12px">Not tracking anything yet.</div>
+      <div id="tracking-list"></div>
+      <div class="save-row">
+        <button class="btn-ghost btn-sm" onclick="checkTrackingNow()" id="check-tracking-btn">Check now</button>
+      </div>
+      <div id="tracking-events" style="margin-top:10px"></div>
+    </div>
+  </details>
 
   <!-- Settings -->
   <details>
@@ -293,6 +311,10 @@
         <div class="settings-field">
           <label>Max simultaneous downloads</label>
           <input type="number" id="s-maxdl" min="1" max="10" style="width:80px">
+        </div>
+        <div class="settings-field">
+          <label>Tracking check interval (hours)</label>
+          <input type="number" id="s-trackinterval" min="1" max="720" style="width:80px">
         </div>
       </div>
       <div class="folder-list" id="folder-list"></div>
@@ -405,6 +427,7 @@ const state = {
   details: null,     // fetched AnimeDetails
   jobs: {},          // job_id -> snapshot
   sources: {},       // job_id -> EventSource
+  tracking: null,    // { tracked_anime, tracking_site, tracking_interval_hrs, events }
 };
 
 // --- Utilities ---
@@ -806,6 +829,7 @@ async function loadSettings() {
     document.getElementById('s-quality').value = state.settings.quality || '720p';
     document.getElementById('s-subdub').value = state.settings.sub_or_dub || 'sub';
     document.getElementById('s-maxdl').value = state.settings.max_simultaneous_downloads || 2;
+    document.getElementById('s-trackinterval').value = state.settings.tracking_interval_hrs || 24;
 
     if (state.settings.browser_only) {
       document.getElementById('queue-section').style.display = 'none';
@@ -826,6 +850,7 @@ async function saveSettings() {
     quality:                   document.getElementById('s-quality').value,
     sub_or_dub:                document.getElementById('s-subdub').value,
     max_simultaneous_downloads: parseInt(document.getElementById('s-maxdl').value),
+    tracking_interval_hrs:      parseInt(document.getElementById('s-trackinterval').value),
   };
   try {
     await fetch('/api/settings', {
@@ -834,11 +859,98 @@ async function saveSettings() {
       body: JSON.stringify(body),
     });
     state.settings = { ...state.settings, ...body };
+    document.getElementById('track-interval-label').textContent = body.tracking_interval_hrs;
     const msg = document.getElementById('save-msg');
     msg.classList.add('visible');
     setTimeout(() => msg.classList.remove('visible'), 2000);
   } catch(e) {
     alert('Failed to save settings: ' + e.message);
+  }
+}
+
+// --- Tracking ---
+
+async function loadTracking() {
+  try {
+    const res = await fetch('/api/tracking');
+    const data = await res.json();
+    state.tracking = data;
+    document.getElementById('track-interval-label').textContent = data.tracking_interval_hrs;
+    renderTracking();
+  } catch {}
+}
+
+function renderTracking() {
+  const t = state.tracking || { tracked_anime: [], events: [] };
+  const list = document.getElementById('tracking-list');
+  const empty = document.getElementById('tracking-empty');
+  if (!t.tracked_anime.length) {
+    empty.style.display = 'block';
+    list.innerHTML = '';
+  } else {
+    empty.style.display = 'none';
+    list.innerHTML = t.tracked_anime.map(title => `
+      <div class="folder-item" style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+        <span>${escHtml(title)}</span>
+        <button class="btn-danger btn-sm" data-untrack-title="${escHtml(title)}">✕</button>
+      </div>
+    `).join('');
+  }
+
+  const events = document.getElementById('tracking-events');
+  events.innerHTML = t.events && t.events.length
+    ? t.events.slice().reverse().map(e => `
+        <div style="font-size:11px;color:var(--muted);margin-top:4px">
+          ${new Date(e.time * 1000).toLocaleString()} — ${escHtml(e.message)}
+        </div>
+      `).join('')
+    : '';
+}
+
+async function trackCurrentAnime() {
+  if (!state.selected) return;
+  const btn = document.getElementById('track-btn');
+  btn.disabled = true;
+  try {
+    const res = await fetch('/api/tracking', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ title: state.selected.title }),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    await loadTracking();
+  } catch(e) {
+    alert('Failed to track anime: ' + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function untrackAnime(title) {
+  try {
+    await fetch(`/api/tracking/${encodeURIComponent(title)}`, { method: 'DELETE' });
+    await loadTracking();
+  } catch(e) {
+    alert('Failed to untrack anime: ' + e.message);
+  }
+}
+
+async function checkTrackingNow() {
+  const btn = document.getElementById('check-tracking-btn');
+  btn.disabled = true;
+  const original = btn.textContent;
+  btn.textContent = 'Checking...';
+  try {
+    const res = await fetch('/api/tracking/check', { method: 'POST' });
+    const data = await res.json();
+    state.tracking = { ...state.tracking, events: data.events };
+    await loadTracking();
+    await loadQueue();
+  } catch(e) {
+    alert('Tracking check failed: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = original;
   }
 }
 
@@ -893,7 +1005,13 @@ async function loadQueue() {
 async function init() {
   await loadSettings();
   await loadQueue();
+  await loadTracking();
 }
+
+document.getElementById('tracking-list').addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-untrack-title]');
+  if (btn) untrackAnime(btn.dataset.untrackTitle);
+});
 
 init();
 </script>
