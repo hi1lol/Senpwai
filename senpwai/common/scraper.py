@@ -105,10 +105,13 @@ def get_new_home_url_from_readme(site_name: str) -> str:
     """
     encoded_readme_text = CLIENT.get(GITHUB_API_README_URL).json()["content"]
     readme_text = b64decode(encoded_readme_text).decode("utf-8")
-    new_domain_name = cast(
-        re.Match, re.search(rf"\[{site_name}\]\((.*)\)", readme_text)
-    ).group(1)
-    return new_domain_name
+    match = re.search(rf"\[{site_name}\]\((.*)\)", readme_text)
+    if match is None:
+        raise RuntimeError(
+            f"Couldn't find a [{site_name}](...) link in the readme — "
+            "its format may have changed"
+        )
+    return match.group(1)
 
 
 class DomainNameError(Exception):

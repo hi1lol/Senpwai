@@ -125,10 +125,13 @@ def extract_stream_url(embed_url: str) -> str:
     encryption_key, iv, decryption_key = (
         _.group(1) for _ in KEYS_REGEX.finditer(streaming_page)
     )
+    encrypted_data_match = ENCRYPTED_DATA_REGEX.search(streaming_page)
+    if encrypted_data_match is None:
+        raise RuntimeError(
+            f"Couldn't find encrypted data on the streaming page for {embed_url}"
+        )
     component = aes_decrypt(
-        cast(re.Match[bytes], ENCRYPTED_DATA_REGEX.search(streaming_page))
-        .group(1)
-        .decode(),
+        encrypted_data_match.group(1).decode(),
         key=encryption_key,
         iv=iv,
     ) + "&id={}&alias={}".format(

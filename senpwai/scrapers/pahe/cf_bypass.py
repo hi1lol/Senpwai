@@ -30,6 +30,7 @@ FLARESOLVERR_DEFAULT_URL = "http://localhost:8191"
 
 KWIK_PROBE_URL = "https://kwik.cx/f/probe"
 PAHE_PROBE_URL = "https://animepahe.pw/"
+PAHEWIN_PROBE_URL = "https://pahe.win/"
 
 
 class KwikSession(TypedDict):
@@ -43,7 +44,11 @@ class KwikSession(TypedDict):
 _MEMO: dict[str, KwikSession] = {}
 # One lock per cache key so that concurrent misses produce a single FlareSolverr solve
 # (each one spins up a browser and takes tens of seconds) instead of one per thread.
-_LOCKS: dict[str, threading.Lock] = {"kwik": threading.Lock(), "pahe": threading.Lock()}
+_LOCKS: dict[str, threading.Lock] = {
+    "kwik": threading.Lock(),
+    "pahe": threading.Lock(),
+    "pahewin": threading.Lock(),
+}
 # Bumped on every successful solve. A force_refresh caller records it before taking the
 # lock; if it changed by the time the lock is acquired, some other thread already
 # replaced the session this caller was rejecting, so there is nothing left to do.
@@ -207,3 +212,10 @@ def get_pahe_session(
     flaresolverr_url: str | None = None,
 ) -> KwikSession:
     return _get_session("pahe", PAHE_PROBE_URL, "animepahe.pw", force_refresh, flaresolverr_url)
+
+
+def get_pahewin_session(
+    force_refresh: bool = False,
+    flaresolverr_url: str | None = None,
+) -> KwikSession:
+    return _get_session("pahewin", PAHEWIN_PROBE_URL, "pahe.win", force_refresh, flaresolverr_url)

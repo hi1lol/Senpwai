@@ -24,7 +24,11 @@ from senpwai.common.scraper import (
     has_valid_internet_connection,
     closest_quality_index,
 )
-from senpwai.scrapers.pahe.cf_bypass import get_kwik_session, get_pahe_session
+from senpwai.scrapers.pahe.cf_bypass import (
+    get_kwik_session,
+    get_pahe_session,
+    get_pahewin_session,
+)
 from senpwai.scrapers.pahe.constants import (
     CHAR_MAP_BASE,
     CHAR_MAP_DIGITS,
@@ -450,7 +454,9 @@ def bind_quality_to_link_info(
 def calculate_total_download_size(bound_info: list[str]) -> int:
     total_size = 0
     for episode in bound_info:
-        match = cast(re.Match, EPISODE_SIZE_REGEX.search(episode))
+        match = EPISODE_SIZE_REGEX.search(episode)
+        if match is None:
+            raise RuntimeError(f"Couldn't parse an episode size out of {episode!r}")
         size = int(match.group(1))
         total_size += size
     return total_size 
@@ -492,18 +498,31 @@ class GetDirectDownloadLinks(ProgressFunction):
         # shorter list under the wrong episode numbers.
         self.skipped: list[tuple[int, str]] = []
 
-    def _resolve_one(self, kwik_session, pahewin_link: str) -> str:
+    def _resolve_one(self, kwik_session, pahewin_session, pahewin_link: str) -> str:
         """Resolve a single pahe.win link to a direct download link."""
-        pahewin_html_page = CLIENT.get(
-            pahewin_link,
-            timeout=KWIK_TIMEOUT_SECONDS[1],
-            # CLIENT retries network errors forever by default, which would hang the
-            # resolve. Let it raise so our bounded retry below owns the policy.
-            exceptions_to_raise=NETWORK_EXCEPTIONS,
+        pahewin_html_page = pahewin_session.get(
+            pahewin_link, timeout=KWIK_TIMEOUT_SECONDS
         ).text
-        kwik_page_link = cast(
-            re.Match[str], KWIK_PAGE_REGEX.search(pahewin_html_page)
-        ).group()
+        kwik_page_match = KWIK_PAGE_REGEX.search(pahewin_html_page)
+        if kwik_page_match is None:
+            # pahe.win sits behind Cloudflare too — clearance probably expired
+            # mid-run; refresh once and retry, same as the kwik leg below.
+            cf = get_pahewin_session(force_refresh=True)
+            pahewin_session.headers["User-Agent"] = cf["user_agent"]
+            pahewin_session.cookies.clear()
+            for name, value in cf["cookies"].items():
+                pahewin_session.cookies.set(name, value, domain=".pahe.win")
+            pahewin_html_page = pahewin_session.get(
+                pahewin_link, timeout=KWIK_TIMEOUT_SECONDS
+            ).text
+            kwik_page_match = KWIK_PAGE_REGEX.search(pahewin_html_page)
+            if kwik_page_match is None:
+                raise RuntimeError(
+                    f"Couldn't find a kwik.cx link on {pahewin_link} "
+                    f"(page snippet: {pahewin_html_page[:200]!r}) "
+                    "after refreshing CF clearance."
+                )
+        kwik_page_link = kwik_page_match.group()
 
         # Extract direct download links from kwik html page
         response = kwik_session.get(kwik_page_link, timeout=KWIK_TIMEOUT_SECONDS)
@@ -556,23 +575,28 @@ class GetDirectDownloadLinks(ProgressFunction):
         """
         direct_download_links: list[str] = []
         self.skipped = []
-        # kwik.cx sits behind a Cloudflare managed challenge. We solve it once
-        # with a real browser (see cf_bypass), cache the cookies + matching UA,
-        # and replay them via curl_cffi so the TLS fingerprint also matches a
-        # real Chrome — CF checks both.
+        # kwik.cx and pahe.win both sit behind a Cloudflare managed challenge. We
+        # solve each once with a real browser (see cf_bypass), cache the cookies +
+        # matching UA, and replay them via curl_cffi so the TLS fingerprint also
+        # matches a real Chrome — CF checks both.
         cf = get_kwik_session()
         kwik_session = curl_requests.Session(impersonate="chrome")
+        pahewin_cf = get_pahewin_session()
+        pahewin_session = curl_requests.Session(impersonate="chrome")
         try:
             kwik_session.headers["User-Agent"] = cf["user_agent"]
             for name, value in cf["cookies"].items():
                 kwik_session.cookies.set(name, value, domain=".kwik.cx")
+            pahewin_session.headers["User-Agent"] = pahewin_cf["user_agent"]
+            for name, value in pahewin_cf["cookies"].items():
+                pahewin_session.cookies.set(name, value, domain=".pahe.win")
 
             for idx, pahewin_link in enumerate(pahewin_download_page_links):
                 last_error: Exception | None = None
                 for attempt in range(MAX_KWIK_RETRIES + 1):
                     try:
                         direct_download_links.append(
-                            self._resolve_one(kwik_session, pahewin_link)
+                            self._resolve_one(kwik_session, pahewin_session, pahewin_link)
                         )
                         last_error = None
                         break
@@ -599,6 +623,7 @@ class GetDirectDownloadLinks(ProgressFunction):
                     progress_update_callback(1)
         finally:
             kwik_session.close()
+            pahewin_session.close()
         return direct_download_links
 
 
