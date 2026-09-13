@@ -5,6 +5,12 @@ import time
 from typing import Any, Callable, NamedTuple, cast
 from bs4 import BeautifulSoup, Tag
 from curl_cffi import requests as curl_requests
+from curl_cffi.requests.exceptions import RequestException as CurlRequestException
+from requests.exceptions import RequestException as HttpRequestException
+
+# CLIENT uses plain requests, the kwik/pahe sessions use curl_cffi, and either can
+# surface the same transient failure.
+NETWORK_EXCEPTIONS = (CurlRequestException, HttpRequestException)
 
 logger = logging.getLogger(__name__)
 from senpwai.common.scraper import (
@@ -50,17 +56,34 @@ Also it seems currently only __ddg2_ is necessary
 
 MAX_RATE_LIMIT_RETRIES = 6
 RATE_LIMIT_BACKOFF_SECONDS = 5
+# curl_cffi defaults to a flat 30s timeout. Split it so an unreachable host fails fast
+# instead of burning the full budget. The read half stays at curl's default, which is
+# evidently enough for requests that work at all — the failure mode here is a hang,
+# not slowness, so a longer wait would only make failures slower.
+PAHE_TIMEOUT_SECONDS = (10, 30)
+# Animepahe intermittently accepts a connection then sends nothing (curl error 28,
+# "0 bytes received"). One of those used to abort a whole download resolve, so retry.
+# Kept small on purpose: _fetch_pahewin_data retries on top of this, and the two
+# budgets multiply.
+MAX_NETWORK_RETRIES = 2
+NETWORK_BACKOFF_SECONDS = 3
+# Same treatment for the kwik.cx leg, which had no timeouts at all and could hang a
+# resolve indefinitely.
+KWIK_TIMEOUT_SECONDS = (10, 30)
+MAX_KWIK_RETRIES = 2
+KWIK_BACKOFF_SECONDS = 3
 # Episode-page (pahewin) fetching: proactive throttle + retry on empty results
 PAHEWIN_REQUEST_DELAY_SECONDS = 1
 MAX_EMPTY_PAGE_RETRIES = 3
 EMPTY_PAGE_BACKOFF_SECONDS = 4
 
 
-def site_request(url: str, allow_redirects=True, _rate_limit_retries=0):
+def site_request(url: str, allow_redirects=True, _rate_limit_retries=0, _network_retries=0):
     """
     For requests that go specifically to the animepahe domain.
     Uses FlareSolverr-obtained cf_clearance cookies + curl_cffi Chrome impersonation
-    to bypass Cloudflare's JS challenge. Retries with backoff on HTTP 429 (rate limit).
+    to bypass Cloudflare's JS challenge. Retries with backoff on HTTP 429 (rate limit)
+    and on transient network failures such as a read timeout.
     """
     global FIRST_REQUEST, PAHE_HOME_URL
     logger.debug("site_request: GET %s (allow_redirects=%s)", url, allow_redirects)
@@ -78,6 +101,7 @@ def site_request(url: str, allow_redirects=True, _rate_limit_retries=0):
                     cookies=request_cookies,
                     headers=request_headers,
                     allow_redirects=allow_redirects,
+                    timeout=PAHE_TIMEOUT_SECONDS,
                 )
             except Exception as e:
                 if has_valid_internet_connection():
@@ -89,11 +113,25 @@ def site_request(url: str, allow_redirects=True, _rate_limit_retries=0):
                 cookies=request_cookies,
                 headers=request_headers,
                 allow_redirects=allow_redirects,
+                timeout=PAHE_TIMEOUT_SECONDS,
             )
         COOKIES.update(dict(response.cookies))
     except DomainNameError:
         PAHE_HOME_URL = get_new_home_url_from_readme(FULL_SITE_NAME)
         return site_request(url)
+    except CurlRequestException as e:
+        # A timeout or dropped connection mid-batch would otherwise abort the entire
+        # download resolve, losing every episode already fetched.
+        if _network_retries >= MAX_NETWORK_RETRIES:
+            logger.error("Network error on %s after %d retries — giving up: %s", url, _network_retries, e)
+            raise
+        wait = NETWORK_BACKOFF_SECONDS * (_network_retries + 1)
+        logger.warning(
+            "Network error on %s (%s) — waiting %ss then retrying (attempt %d)",
+            url, e, wait, _network_retries + 1,
+        )
+        time.sleep(wait)
+        return site_request(url, allow_redirects, _rate_limit_retries, _network_retries + 1)
 
     logger.debug(
         "site_request: status=%s url=%s content-type=%s body[:300]=%r",
@@ -264,23 +302,40 @@ class GetEpisodePageLinks(ProgressFunction):
 class GetPahewinPageLinks(ProgressFunction):
     def __init__(self) -> None:
         super().__init__()
+        # Indices into episode_page_links that yielded no download links, with a
+        # reason. Callers must account for these: the returned lists are shorter
+        # than the input, so positional episode numbering shifts without them.
+        self.skipped: list[tuple[int, str]] = []
 
     def _fetch_pahewin_data(self, episode_page_link: str):
         """Fetch an episode page and extract its download dropdown links.
 
         Retries on an empty result — animepahe intermittently rate-limits (HTTP 429)
         or serves a Cloudflare challenge during rapid batch fetches. Returns the
-        BeautifulSoup ``find_all`` result (empty list if it genuinely has no links).
+        BeautifulSoup ``find_all`` result (empty list if it genuinely has no links),
+        paired with a reason string describing why it is empty.
         """
+        reason = "no download links on the episode page"
         for attempt in range(MAX_EMPTY_PAGE_RETRIES + 1):
-            page_content = site_request(episode_page_link, allow_redirects=True).content
-            soup = BeautifulSoup(page_content, PARSER)
-            pahewin_data = soup.find_all("a", class_="dropdown-item", target="_blank")
+            try:
+                page_content = site_request(episode_page_link, allow_redirects=True).content
+            except NETWORK_EXCEPTIONS as e:
+                # site_request already retried this; treat a still-failing request the
+                # same as an empty page so one bad episode doesn't abort the whole
+                # resolve and discard every episode fetched before it.
+                logger.warning("Request failed for %s (attempt %d): %s", episode_page_link, attempt + 1, e)
+                page_content = b""
+                pahewin_data = []
+                reason = f"request failed: {e}"
+            else:
+                soup = BeautifulSoup(page_content, PARSER)
+                pahewin_data = soup.find_all("a", class_="dropdown-item", target="_blank")
             if pahewin_data:
-                return pahewin_data
+                return pahewin_data, ""
             if b"Just a moment" in page_content:
                 logger.warning("CF challenge on %s — refreshing session", episode_page_link)
                 get_pahe_session(force_refresh=True)
+                reason = "blocked by a Cloudflare challenge"
             if attempt < MAX_EMPTY_PAGE_RETRIES:
                 wait = EMPTY_PAGE_BACKOFF_SECONDS * (attempt + 1)
                 logger.warning(
@@ -288,7 +343,7 @@ class GetPahewinPageLinks(ProgressFunction):
                     episode_page_link, attempt + 1, wait,
                 )
                 time.sleep(wait)
-        return []
+        return [], reason
 
     def get_pahewin_page_links_and_info(
         self,
@@ -297,13 +352,15 @@ class GetPahewinPageLinks(ProgressFunction):
     ) -> tuple[list[list[str]], list[list[str]]]:
         pahewin_links: list[list[str]] = []
         download_info: list[list[str]] = []
-        for episode_page_link in episode_page_links:
-            pahewin_data = self._fetch_pahewin_data(episode_page_link)
+        self.skipped = []
+        for idx, episode_page_link in enumerate(episode_page_links):
+            pahewin_data, reason = self._fetch_pahewin_data(episode_page_link)
             if pahewin_data:
                 pahewin_links.append([cast(str, link["href"]) for link in pahewin_data])
                 download_info.append([li.text.strip() for li in pahewin_data])
             else:
                 logger.error("No download links found for %s after retries — skipping", episode_page_link)
+                self.skipped.append((idx, reason))
             self.resume.wait()
             if self.cancelled:
                 return ([], [])
@@ -331,6 +388,11 @@ def dub_available(anime_page_link: str, anime_id: str) -> bool:
         download_info,
     ) = GetPahewinPageLinks().get_pahewin_page_links_and_info([episode_page_link])
 
+    if not download_info:
+        # The probe episode was skipped, so we simply don't know. Report no dub
+        # rather than raising IndexError and failing the whole details lookup.
+        logger.warning("Could not determine dub availability for %s", anime_page_link)
+        return False
     for info in download_info[0]:
         if is_dub(info):
             return True
@@ -341,10 +403,19 @@ def bind_sub_or_dub_to_link_info(
     sub_or_dub: str,
     pahewin_download_page_links: list[list[str]],
     download_info: list[list[str]],
+    dropped: list[tuple[int, str]] | None = None,
 ) -> tuple[list[list[str]], list[list[str]]]:
+    """Keep only the links matching sub or dub.
+
+    An episode with no matching link is dropped, which shortens the returned lists.
+    Pass ``dropped`` to receive the (index, reason) pairs so callers can keep their
+    episode numbering aligned and report the gap.
+    """
     bound_links: list[list[str]] = []
     bound_info: list[list[str]] = []
-    for link_list, episode_info in zip(pahewin_download_page_links, download_info):
+    for idx, (link_list, episode_info) in enumerate(
+        zip(pahewin_download_page_links, download_info)
+    ):
         links: list[str] = []
         infos: list[str] = []
         for link, info in zip(link_list, episode_info):
@@ -357,6 +428,8 @@ def bind_sub_or_dub_to_link_info(
         if links and infos:
             bound_links.append(links)
             bound_info.append(infos)
+        elif dropped is not None:
+            dropped.append((idx, f"no {sub_or_dub} version available"))
     return (bound_links, bound_info)
 
 
@@ -414,13 +487,75 @@ def decrypt_post_form(full_key: str, key: str, v1: int, v2: int) -> str:
 class GetDirectDownloadLinks(ProgressFunction):
     def __init__(self) -> None:
         super().__init__()
+        # Indices into the input list that could not be resolved, with a reason.
+        # Callers read this to report the gap instead of silently downloading a
+        # shorter list under the wrong episode numbers.
+        self.skipped: list[tuple[int, str]] = []
+
+    def _resolve_one(self, kwik_session, pahewin_link: str) -> str:
+        """Resolve a single pahe.win link to a direct download link."""
+        pahewin_html_page = CLIENT.get(
+            pahewin_link,
+            timeout=KWIK_TIMEOUT_SECONDS[1],
+            # CLIENT retries network errors forever by default, which would hang the
+            # resolve. Let it raise so our bounded retry below owns the policy.
+            exceptions_to_raise=NETWORK_EXCEPTIONS,
+        ).text
+        kwik_page_link = cast(
+            re.Match[str], KWIK_PAGE_REGEX.search(pahewin_html_page)
+        ).group()
+
+        # Extract direct download links from kwik html page
+        response = kwik_session.get(kwik_page_link, timeout=KWIK_TIMEOUT_SECONDS)
+        match = PARAM_REGEX.search(response.text)
+        if match is None:
+            # Clearance probably expired mid-run; refresh once and retry.
+            cf = get_kwik_session(force_refresh=True)
+            kwik_session.headers["User-Agent"] = cf["user_agent"]
+            kwik_session.cookies.clear()
+            for name, value in cf["cookies"].items():
+                kwik_session.cookies.set(name, value, domain=".kwik.cx")
+            response = kwik_session.get(kwik_page_link, timeout=KWIK_TIMEOUT_SECONDS)
+            match = PARAM_REGEX.search(response.text)
+            if match is None:
+                raise RuntimeError(
+                    f"Failed to extract kwik params from {kwik_page_link} "
+                    f"(status={response.status_code}) after refreshing CF clearance."
+                )
+        full_key, key, v1, v2 = (
+            match.group(1),
+            match.group(2),
+            match.group(3),
+            match.group(4),
+        )
+        form = decrypt_post_form(full_key, key, int(v1), int(v2))
+        soup = BeautifulSoup(form, PARSER)
+        post_url = cast(str, cast(Tag, soup.form)["action"])
+        token_value = cast(str, cast(Tag, soup.input)["value"])
+        response = kwik_session.post(
+            post_url,
+            headers={"Referer": kwik_page_link},
+            data={"_token": token_value},
+            allow_redirects=False,
+            timeout=KWIK_TIMEOUT_SECONDS,
+        )
+        return response.headers["Location"]
 
     def get_direct_download_links(
         self,
         pahewin_download_page_links: list[str],
         progress_update_callback: Callable[[int], None] | None = None,
+        skip_failures: bool = False,
     ) -> list[str]:
+        """Resolve pahe.win links to direct download links.
+
+        ``skip_failures`` records an unresolvable episode in ``self.skipped`` and
+        carries on, instead of raising. Only pass it if you also realign your episode
+        numbering against ``self.skipped`` — the returned list is shorter than the
+        input, so anything indexing episodes positionally will silently mislabel them.
+        """
         direct_download_links: list[str] = []
+        self.skipped = []
         # kwik.cx sits behind a Cloudflare managed challenge. We solve it once
         # with a real browser (see cf_bypass), cache the cookies + matching UA,
         # and replay them via curl_cffi so the TLS fingerprint also matches a
@@ -432,48 +567,31 @@ class GetDirectDownloadLinks(ProgressFunction):
             for name, value in cf["cookies"].items():
                 kwik_session.cookies.set(name, value, domain=".kwik.cx")
 
-            for pahewin_link in pahewin_download_page_links:
-                # Extract kwik page links
-                pahewin_html_page = CLIENT.get(pahewin_link).text
-                kwik_page_link = cast(
-                    re.Match[str], KWIK_PAGE_REGEX.search(pahewin_html_page)
-                ).group()
-
-                # Extract direct download links from kwik html page
-                response = kwik_session.get(kwik_page_link)
-                match = PARAM_REGEX.search(response.text)
-                if match is None:
-                    # Clearance probably expired mid-run; refresh once and retry.
-                    cf = get_kwik_session(force_refresh=True)
-                    kwik_session.headers["User-Agent"] = cf["user_agent"]
-                    kwik_session.cookies.clear()
-                    for name, value in cf["cookies"].items():
-                        kwik_session.cookies.set(name, value, domain=".kwik.cx")
-                    response = kwik_session.get(kwik_page_link)
-                    match = PARAM_REGEX.search(response.text)
-                    if match is None:
-                        raise RuntimeError(
-                            f"Failed to extract kwik params from {kwik_page_link} "
-                            f"(status={response.status_code}) after refreshing CF clearance."
+            for idx, pahewin_link in enumerate(pahewin_download_page_links):
+                last_error: Exception | None = None
+                for attempt in range(MAX_KWIK_RETRIES + 1):
+                    try:
+                        direct_download_links.append(
+                            self._resolve_one(kwik_session, pahewin_link)
                         )
-                full_key, key, v1, v2 = (
-                    match.group(1),
-                    match.group(2),
-                    match.group(3),
-                    match.group(4),
-                )
-                form = decrypt_post_form(full_key, key, int(v1), int(v2))
-                soup = BeautifulSoup(form, PARSER)
-                post_url = cast(str, cast(Tag, soup.form)["action"])
-                token_value = cast(str, cast(Tag, soup.input)["value"])
-                response = kwik_session.post(
-                    post_url,
-                    headers={"Referer": kwik_page_link},
-                    data={"_token": token_value},
-                    allow_redirects=False,
-                )
-                direct_download_link = response.headers["Location"]
-                direct_download_links.append(direct_download_link)
+                        last_error = None
+                        break
+                    except Exception as e:
+                        last_error = e
+                        if attempt < MAX_KWIK_RETRIES:
+                            wait = KWIK_BACKOFF_SECONDS * (attempt + 1)
+                            logger.warning(
+                                "Failed to resolve %s (attempt %d): %s — retrying in %ss",
+                                pahewin_link, attempt + 1, e, wait,
+                            )
+                            time.sleep(wait)
+                if last_error is not None:
+                    if not skip_failures:
+                        raise last_error
+                    # Record and move on rather than aborting the whole resolve and
+                    # discarding every episode already resolved.
+                    logger.error("Giving up on %s: %s", pahewin_link, last_error)
+                    self.skipped.append((idx, str(last_error)))
                 self.resume.wait()
                 if self.cancelled:
                     return []

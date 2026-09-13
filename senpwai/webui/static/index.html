@@ -116,6 +116,7 @@
     .badge-done      { background: #1a3a1a; color: var(--success); }
     .badge-failed    { background: #3a1a1a; color: var(--error); }
     .badge-cancelled { background: #2a2a2a; color: var(--muted); }
+    .badge-skipped   { background: #3a2a0a; color: var(--warn); }
     .badge-pahe      { background: #2a1a4a; color: #b388ff; }
     .badge-dub       { background: #3a2a0a; color: var(--warn); }
 
@@ -142,6 +143,13 @@
 
     .ep-list { display: flex; flex-direction: column; gap: 6px; }
     .ep-row { font-size: 12px; }
+    .ep-reason {
+      color: var(--muted); font-size: 11px; margin-top: 2px;
+      overflow-wrap: anywhere;
+    }
+    .ep-summary {
+      margin-top: 8px; font-size: 12px; color: var(--warn);
+    }
     .ep-name { color: var(--muted); margin-bottom: 3px; display: flex; justify-content: space-between; }
     .ep-name span { color: var(--text); }
     progress.ep-bar { height: 5px; }
@@ -718,8 +726,19 @@ function renderJobCard(job_id) {
     bodyHtml = `<div style="color:var(--muted);font-size:12px"><span class="spinner"></span>${escHtml(j.resolve_step) || 'Preparing...'}</div>`;
   } else if ((j.status === 'downloading' || isTerminal) && j.episodes.length > 0) {
     const epRows = j.episodes.map(ep => {
-      const p = pct(ep.downloaded_bytes, ep.total_bytes);
       const done = ep.status === 'done';
+      // An episode that never resolved has no link and so no progress bar to show —
+      // it gets the reason instead, which is the whole point of surfacing it.
+      if (ep.status === 'skipped' || ep.status === 'failed') {
+        const label = ep.status === 'skipped' ? 'skipped' : 'failed';
+        return `<div class="ep-row">
+          <div class="ep-name">
+            <span>${escHtml(ep.episode_title)}</span>
+            <span class="badge badge-${ep.status}">${label}</span>
+          </div>
+          ${ep.error ? `<div class="ep-reason">${escHtml(ep.error)}</div>` : ''}
+        </div>`;
+      }
       const cls = done ? 'ep-done' : '';
       const sizeStr = ep.total_bytes ? `${fmt(ep.downloaded_bytes)} / ${fmt(ep.total_bytes)}` : '';
       return `<div class="ep-row">
@@ -728,6 +747,14 @@ function renderJobCard(job_id) {
       </div>`;
     }).join('');
     bodyHtml = `<div class="ep-list">${epRows}</div>`;
+    const nSkipped = j.episodes.filter(ep => ep.status === 'skipped').length;
+    const nFailed = j.episodes.filter(ep => ep.status === 'failed').length;
+    if (isTerminal && (nSkipped || nFailed)) {
+      const parts = [];
+      if (nFailed) parts.push(`${nFailed} failed`);
+      if (nSkipped) parts.push(`${nSkipped} skipped`);
+      bodyHtml += `<div class="ep-summary">${parts.join(', ')} — not downloaded.</div>`;
+    }
   } else if (j.status === 'queued') {
     bodyHtml = `<div style="color:var(--muted);font-size:12px">Waiting to start...</div>`;
   }
@@ -742,6 +769,13 @@ function renderJobCard(job_id) {
   const retryBtn = j.status === 'failed'
     ? `<button class="btn-primary btn-sm" onclick="retryJob('${job_id}')">↺ Retry</button>`
     : '';
+  const nIncomplete = j.episodes.filter(
+    ep => (ep.status === 'skipped' || ep.status === 'failed') && ep.episode_number !== null
+  ).length;
+  const retryEpsBtn = isTerminal && nIncomplete
+    ? `<button class="btn-primary btn-sm" onclick="retryEpisodes('${job_id}')"
+               title="Queue a new job for just these episodes">↺ Retry ${nIncomplete} episode${nIncomplete > 1 ? 's' : ''}</button>`
+    : '';
   const removeBtn = isTerminal
     ? `<button class="btn-ghost btn-sm" onclick="removeJob('${job_id}')">Remove</button>`
     : `<button class="btn-danger btn-sm" onclick="removeJob('${job_id}')">Cancel</button>`;
@@ -755,6 +789,7 @@ function renderJobCard(job_id) {
         ${statusBadge}
         ${startBtn}
         ${retryBtn}
+        ${retryEpsBtn}
         ${removeBtn}
       </div>
     </div>
@@ -819,6 +854,18 @@ async function retryJob(job_id) {
   subscribeSSE(job_id);
 }
 
+async function retryEpisodes(job_id) {
+  const res = await fetch(`/api/queue/${job_id}/retry-episodes`, { method: 'POST' });
+  if (!res.ok) {
+    alert('Could not retry: ' + await res.text());
+    return;
+  }
+  // The retry is a new job so the original keeps showing what did download.
+  const { job_id: newId } = await res.json();
+  await loadQueue();
+  subscribeSSE(newId);
+}
+
 async function startAll() {
   const res = await fetch('/api/queue/start-all', { method: 'POST' });
   const { started } = await res.json();
@@ -829,8 +876,7 @@ async function startAll() {
 
 // --- Init ---
 
-async function init() {
-  await loadSettings();
+async function loadQueue() {
   try {
     const res = await fetch('/api/queue');
     const { jobs } = await res.json();
@@ -842,6 +888,11 @@ async function init() {
     });
     renderQueue();
   } catch {}
+}
+
+async function init() {
+  await loadSettings();
+  await loadQueue();
 }
 
 init();

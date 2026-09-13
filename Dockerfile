@@ -17,6 +17,6 @@ COPY senpwai/ senpwai/
 # Default download path used by SETTINGS
 RUN mkdir -p /root/Downloads/Anime
 
-EXPOSE 8080
+EXPOSE 8180
 
-CMD ["python", "-m", "senpwai.webui.server", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["python", "-m", "senpwai.webui.server", "--host", "0.0.0.0", "--port", "8180"]

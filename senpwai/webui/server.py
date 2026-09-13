@@ -245,6 +245,18 @@ async def start_all_queue_items() -> dict:
     return {"started": started}
 
 
+@app.post("/api/queue/{job_id}/retry-episodes")
+async def retry_failed_episodes(job_id: str) -> dict:
+    _require_queue()
+    new_job_id = QUEUE_MANAGER.retry_episodes(job_id)
+    if new_job_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Job not found, still running, or has no failed/skipped episodes",
+        )
+    return {"ok": True, "job_id": new_job_id}
+
+
 @app.post("/api/queue/{job_id}/retry")
 async def retry_queue_item(job_id: str) -> dict:
     _require_queue()

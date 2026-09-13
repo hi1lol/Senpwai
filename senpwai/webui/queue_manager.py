@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+import uuid
 from typing import Callable
 
 from senpwai.common.classes import SETTINGS, Anime, AnimeDetails, get_max_part_size
@@ -13,16 +14,28 @@ from senpwai.scrapers import gogo, pahe
 
 
 class EpisodeProgress:
-    def __init__(self, episode_title: str, total_bytes: int = 0) -> None:
+    def __init__(
+        self,
+        episode_title: str,
+        total_bytes: int = 0,
+        episode_number: int | None = None,
+        status: str = "pending",
+        error: str | None = None,
+    ) -> None:
         self.episode_title = episode_title
-        self.status = "pending"  # pending | downloading | done | failed
+        # pending | downloading | done | failed | skipped
+        # "skipped" means it never got as far as downloading: resolving its link
+        # failed, so there was nothing to download.
+        self.status = status
+        self.episode_number = episode_number
         self.downloaded_bytes = 0
         self.total_bytes = total_bytes
-        self.error: str | None = None
+        self.error = error
 
     def to_dict(self) -> dict:
         return {
             "episode_title": self.episode_title,
+            "episode_number": self.episode_number,
             "status": self.status,
             "downloaded_bytes": self.downloaded_bytes,
             "total_bytes": self.total_bytes,
@@ -43,8 +56,12 @@ class QueueItem:
         quality: str,
         sub_or_dub: str,
         hls_mode: bool,
+        only_episodes: list[int] | None = None,
     ) -> None:
         self.job_id = job_id
+        # When set, restrict the job to exactly these episode numbers. Used to retry
+        # the failed/skipped episodes of an earlier job, which need not be contiguous.
+        self.only_episodes = only_episodes
         self.anime_title = anime_title
         self.page_link = page_link
         self.anime_id = anime_id
@@ -76,6 +93,7 @@ class QueueItem:
             "quality": self.quality,
             "sub_or_dub": self.sub_or_dub,
             "hls_mode": self.hls_mode,
+            "only_episodes": self.only_episodes,
             "status": self.status,
             "resolve_step": self.resolve_step,
             "resolve_current": self.resolve_current,
@@ -148,6 +166,41 @@ class DownloadQueueManager:
         self._notify_subscribers(item.job_id)
         threading.Thread(target=self._run_job, args=(item,), daemon=True).start()
         return True
+
+    def retry_episodes(self, job_id: str) -> str | None:
+        """Queue a new job for just the failed/skipped episodes of a finished one.
+
+        A separate job rather than a reset of the original, so the episodes that did
+        download stay visible instead of being wiped by a full retry.
+        """
+        item = self.get(job_id)
+        if item is None or item.status not in ("done", "failed", "cancelled"):
+            return None
+        episode_numbers = sorted(
+            {
+                ep.episode_number
+                for ep in item.episodes
+                if ep.status in ("failed", "skipped") and ep.episode_number is not None
+            }
+        )
+        if not episode_numbers:
+            return None
+        retry_item = QueueItem(
+            job_id=str(uuid.uuid4()),
+            anime_title=item.anime_title,
+            page_link=item.page_link,
+            anime_id=item.anime_id,
+            site=item.site,
+            start_episode=episode_numbers[0],
+            end_episode=episode_numbers[-1],
+            quality=item.quality,
+            sub_or_dub=item.sub_or_dub,
+            hls_mode=item.hls_mode,
+            only_episodes=episode_numbers,
+        )
+        self.enqueue(retry_item)
+        self.start(retry_item.job_id)
+        return retry_item.job_id
 
     def cancel(self, job_id: str) -> bool:
         item = self.get(job_id)
@@ -238,6 +291,12 @@ class DownloadQueueManager:
                 return
 
             if not ddls:
+                skipped = [ep for ep in item.episodes if ep.status == "skipped"]
+                if skipped:
+                    raise RuntimeError(
+                        f"Could not resolve a download link for any of the "
+                        f"{len(skipped)} requested episode(s)"
+                    )
                 raise RuntimeError("No episodes to download — you may already have them all")
 
             self._update_status(item, "downloading")
@@ -286,6 +345,9 @@ class DownloadQueueManager:
         if not anime_details.lacked_episodes:
             return []
         ep_page_links = anime_details.get_lacked_links(ep_page_links)
+        ep_page_links = self._apply_only_episodes(item, anime_details, ep_page_links)
+        if not ep_page_links:
+            return []
 
         if item._cancel_event.is_set():
             return []
@@ -297,12 +359,21 @@ class DownloadQueueManager:
             item.resolve_total = len(ep_page_links)
         self._notify_subscribers(item.job_id)
 
-        pahewin_links, info = pahe.GetPahewinPageLinks().get_pahewin_page_links_and_info(
+        pahewin_getter = pahe.GetPahewinPageLinks()
+        pahewin_links, info = pahewin_getter.get_pahewin_page_links_and_info(
             ep_page_links, lambda n: self._resolve_progress(item, n)
         )
+        # Each filtering stage below shortens the list. episode_title(idx) indexes
+        # lacked_episodes positionally, so lacked_episodes has to shrink in lockstep
+        # or every episode after a gap gets saved under the wrong number.
+        self._drop_episodes(item, anime_details, pahewin_getter.skipped)
+
+        dropped: list[tuple[int, str]] = []
         pahewin_links, info = pahe.bind_sub_or_dub_to_link_info(
-            item.sub_or_dub, pahewin_links, info
+            item.sub_or_dub, pahewin_links, info, dropped
         )
+        self._drop_episodes(item, anime_details, dropped)
+
         pahewin_links, info = pahe.bind_quality_to_link_info(
             item.quality, pahewin_links, info
         )
@@ -317,10 +388,60 @@ class DownloadQueueManager:
             item.resolve_total = len(pahewin_links)
         self._notify_subscribers(item.job_id)
 
-        ddls = pahe.GetDirectDownloadLinks().get_direct_download_links(
-            pahewin_links, lambda n: self._resolve_progress(item, n)
+        ddl_getter = pahe.GetDirectDownloadLinks()
+        ddls = ddl_getter.get_direct_download_links(
+            pahewin_links, lambda n: self._resolve_progress(item, n), skip_failures=True
         )
+        self._drop_episodes(item, anime_details, ddl_getter.skipped)
         return ddls
+
+    def _apply_only_episodes(
+        self, item: QueueItem, anime_details: AnimeDetails, links: list
+    ) -> list:
+        """Narrow a resolve to item.only_episodes, keeping lacked_episodes aligned."""
+        if item.only_episodes is None:
+            return links
+        wanted = set(item.only_episodes)
+        keep = [
+            i
+            for i, ep in enumerate(anime_details.lacked_episodes)
+            if ep in wanted and i < len(links)
+        ]
+        anime_details.lacked_episodes = [anime_details.lacked_episodes[i] for i in keep]
+        return [links[i] for i in keep]
+
+    def _drop_episodes(
+        self,
+        item: QueueItem,
+        anime_details: AnimeDetails,
+        dropped: list[tuple[int, str]],
+    ) -> None:
+        """Remove episodes that could not be resolved, and record them as skipped.
+
+        ``dropped`` holds indices into the *current* lacked_episodes list, so this
+        must be called immediately after the stage that produced them.
+        """
+        if not dropped:
+            return
+        by_index = dict(dropped)
+        skipped = [
+            EpisodeProgress(
+                episode_title=anime_details.episode_title(idx, False),
+                episode_number=anime_details.lacked_episodes[idx],
+                status="skipped",
+                error=reason,
+            )
+            for idx, reason in sorted(dropped)
+            if idx < len(anime_details.lacked_episodes)
+        ]
+        anime_details.lacked_episodes = [
+            ep
+            for idx, ep in enumerate(anime_details.lacked_episodes)
+            if idx not in by_index
+        ]
+        with item._lock:
+            item.episodes.extend(skipped)
+        self._notify_subscribers(item.job_id)
 
     def _resolve_gogo(
         self, item: QueueItem, anime_details: AnimeDetails
@@ -335,6 +456,9 @@ class DownloadQueueManager:
         if not anime_details.lacked_episodes:
             return [], None, False
         dl_page_links = anime_details.get_lacked_links(dl_page_links)
+        dl_page_links = self._apply_only_episodes(item, anime_details, dl_page_links)
+        if not dl_page_links:
+            return [], None, False
 
         if item._cancel_event.is_set():
             return [], None, False
@@ -396,13 +520,19 @@ class DownloadQueueManager:
         sem = threading.Semaphore(SETTINGS.max_simultaneous_downloads)
 
         with item._lock:
+            # Episodes skipped during resolve are already recorded; keep them, but
+            # after the downloadable ones so ep_thread's index still lines up.
+            already_skipped = [ep for ep in item.episodes if ep.status == "skipped"]
             item.episodes = [
                 EpisodeProgress(
                     episode_title=anime_details.episode_title(i, False),
+                    episode_number=anime_details.lacked_episodes[i]
+                    if i < len(anime_details.lacked_episodes)
+                    else None,
                     total_bytes=download_sizes[i] if download_sizes else 0,
                 )
                 for i in range(len(ddls_or_segs))
-            ]
+            ] + already_skipped
         self._notify_subscribers(item.job_id)
 
         failures: list[tuple[int, str]] = []
