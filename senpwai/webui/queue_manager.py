@@ -381,19 +381,11 @@ class DownloadQueueManager:
         if item._cancel_event.is_set():
             return []
 
-        # Step 3 — direct download links (resolves kwik.cx via FlareSolverr)
-        with item._lock:
-            item.resolve_step = "Getting direct download links"
-            item.resolve_current = 0
-            item.resolve_total = len(pahewin_links)
-        self._notify_subscribers(item.job_id)
-
-        ddl_getter = pahe.GetDirectDownloadLinks()
-        ddls = ddl_getter.get_direct_download_links(
-            pahewin_links, lambda n: self._resolve_progress(item, n), skip_failures=True
-        )
-        self._drop_episodes(item, anime_details, ddl_getter.skipped)
-        return ddls
+        # Direct download links (owocdn/kwik) are short-lived, so they're resolved
+        # just before each episode's own download starts (see _do_downloads /
+        # ep_thread) instead of as a batch here — a long queue would otherwise let
+        # early-resolved links go stale before their turn to download comes up.
+        return pahewin_links
 
     def _apply_only_episodes(
         self, item: QueueItem, anime_details: AnimeDetails, links: list
@@ -549,6 +541,12 @@ class DownloadQueueManager:
                     elif is_hls:
                         size = len(link)  # type: ignore[arg-type]
                     else:
+                        # PAHE: `link` here is still the pahe.win page link, not yet
+                        # resolved. Resolve it to the actual owocdn/kwik URL right
+                        # before downloading — those links are short-lived, so
+                        # resolving a whole batch upfront risked expiry for episodes
+                        # near the end of a long queue.
+                        link = pahe.GetDirectDownloadLinks().resolve_one(link)  # type: ignore[arg-type]
                         size, link = Download.get_total_download_size(  # type: ignore[assignment]
                             link, referer=referer  # type: ignore[arg-type]
                         )

@@ -517,6 +517,12 @@ def download_manager(
         elif is_hls_download:
             download_size = len(link)
         else:
+            # PAHE: `link` here is still the pahe.win page link, not yet resolved.
+            # Resolve it to the actual owocdn/kwik URL right before downloading —
+            # those links are short-lived, so resolving a whole batch upfront (see
+            # handle_pahe) risked expiry for episodes near the end of a long queue.
+            if anime_details.site == PAHE:
+                link = pahe.GetDirectDownloadLinks().resolve_one(cast(str, link))
             download_size, link = Download.get_total_download_size(
                 cast(str, link), referer=referer
             )
@@ -634,12 +640,14 @@ def handle_pahe(parsed: Namespace, anime_details: AnimeDetails):
     download_page_links = pahe_get_download_page_links(
         episode_page_links, parsed.quality, parsed.sub_or_dub
     )
-    direct_download_links = pahe_get_direct_download_links(download_page_links)
     if parsed.direct_download_links:
-        print_direct_download_links(direct_download_links)
+        print_direct_download_links(pahe_get_direct_download_links(download_page_links))
         return
+    # Direct download links are resolved just before each episode's own download
+    # starts (see download_manager) instead of all upfront — kwik/owocdn links are
+    # short-lived, so batch-resolving a long queue risked expiry for later episodes.
     download_manager(
-        direct_download_links, anime_details, False, parsed.max_simultaneous_downloads
+        download_page_links, anime_details, False, parsed.max_simultaneous_downloads
     )
 
 

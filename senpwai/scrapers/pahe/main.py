@@ -560,21 +560,16 @@ class GetDirectDownloadLinks(ProgressFunction):
         )
         return response.headers["Location"]
 
-    def get_direct_download_links(
-        self,
-        pahewin_download_page_links: list[str],
-        progress_update_callback: Callable[[int], None] | None = None,
-        skip_failures: bool = False,
-    ) -> list[str]:
-        """Resolve pahe.win links to direct download links.
+    def resolve_one(self, pahewin_link: str) -> str:
+        """Resolve a single pahe.win link to a direct download link.
 
-        ``skip_failures`` records an unresolvable episode in ``self.skipped`` and
-        carries on, instead of raising. Only pass it if you also realign your episode
-        numbering against ``self.skipped`` — the returned list is shorter than the
-        input, so anything indexing episodes positionally will silently mislabel them.
+        Builds its own short-lived kwik/pahewin sessions rather than sharing them
+        across a batch, so it's safe to call this right before the link is actually
+        needed (even concurrently from multiple threads) instead of resolving a whole
+        episode range upfront — kwik.cx/owocdn links are short-lived, and resolving a
+        long batch in advance risks the link (or the CF clearance used to fetch it)
+        going stale before later episodes get their turn to download.
         """
-        direct_download_links: list[str] = []
-        self.skipped = []
         # kwik.cx and pahe.win both sit behind a Cloudflare managed challenge. We
         # solve each once with a real browser (see cf_bypass), cache the cookies +
         # matching UA, and replay them via curl_cffi so the TLS fingerprint also
@@ -591,39 +586,55 @@ class GetDirectDownloadLinks(ProgressFunction):
             for name, value in pahewin_cf["cookies"].items():
                 pahewin_session.cookies.set(name, value, domain=".pahe.win")
 
-            for idx, pahewin_link in enumerate(pahewin_download_page_links):
-                last_error: Exception | None = None
-                for attempt in range(MAX_KWIK_RETRIES + 1):
-                    try:
-                        direct_download_links.append(
-                            self._resolve_one(kwik_session, pahewin_session, pahewin_link)
+            last_error: Exception | None = None
+            for attempt in range(MAX_KWIK_RETRIES + 1):
+                try:
+                    return self._resolve_one(kwik_session, pahewin_session, pahewin_link)
+                except Exception as e:
+                    last_error = e
+                    if attempt < MAX_KWIK_RETRIES:
+                        wait = KWIK_BACKOFF_SECONDS * (attempt + 1)
+                        logger.warning(
+                            "Failed to resolve %s (attempt %d): %s — retrying in %ss",
+                            pahewin_link, attempt + 1, e, wait,
                         )
-                        last_error = None
-                        break
-                    except Exception as e:
-                        last_error = e
-                        if attempt < MAX_KWIK_RETRIES:
-                            wait = KWIK_BACKOFF_SECONDS * (attempt + 1)
-                            logger.warning(
-                                "Failed to resolve %s (attempt %d): %s — retrying in %ss",
-                                pahewin_link, attempt + 1, e, wait,
-                            )
-                            time.sleep(wait)
-                if last_error is not None:
-                    if not skip_failures:
-                        raise last_error
-                    # Record and move on rather than aborting the whole resolve and
-                    # discarding every episode already resolved.
-                    logger.error("Giving up on %s: %s", pahewin_link, last_error)
-                    self.skipped.append((idx, str(last_error)))
-                self.resume.wait()
-                if self.cancelled:
-                    return []
-                if progress_update_callback:
-                    progress_update_callback(1)
+                        time.sleep(wait)
+            assert last_error is not None
+            raise last_error
         finally:
             kwik_session.close()
             pahewin_session.close()
+
+    def get_direct_download_links(
+        self,
+        pahewin_download_page_links: list[str],
+        progress_update_callback: Callable[[int], None] | None = None,
+        skip_failures: bool = False,
+    ) -> list[str]:
+        """Resolve pahe.win links to direct download links.
+
+        ``skip_failures`` records an unresolvable episode in ``self.skipped`` and
+        carries on, instead of raising. Only pass it if you also realign your episode
+        numbering against ``self.skipped`` — the returned list is shorter than the
+        input, so anything indexing episodes positionally will silently mislabel them.
+        """
+        direct_download_links: list[str] = []
+        self.skipped = []
+        for idx, pahewin_link in enumerate(pahewin_download_page_links):
+            try:
+                direct_download_links.append(self.resolve_one(pahewin_link))
+            except Exception as e:
+                if not skip_failures:
+                    raise
+                # Record and move on rather than aborting the whole resolve and
+                # discarding every episode already resolved.
+                logger.error("Giving up on %s: %s", pahewin_link, e)
+                self.skipped.append((idx, str(e)))
+            self.resume.wait()
+            if self.cancelled:
+                return []
+            if progress_update_callback:
+                progress_update_callback(1)
         return direct_download_links
 
 
