@@ -1,0 +1,8 @@
+.git
+.venv
+.venv-termux
+downloads
+docs
+**/__pycache__
+.ruff_cache
+.pytest_cache

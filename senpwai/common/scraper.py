@@ -15,6 +15,13 @@ import requests
 from curl_cffi import requests as curl_requests
 from curl_cffi.requests.exceptions import RequestException as CurlRequestException
 
+from senpwai.common.errors import (
+    SenpError,
+    body_snippet,
+    check_response,
+    describe_exception,
+    status_hint,
+)
 from senpwai.common.static import OS, log_exception, try_deleting
 
 T = TypeVar("T")
@@ -85,14 +92,29 @@ USER_AGENTS = (
 )
 
 
-class NoResourceLengthException(Exception):
-    def __init__(self, url: str, redirect_url: str) -> None:
+class NoResourceLengthException(SenpError):
+    def __init__(
+        self,
+        url: str,
+        redirect_url: str,
+        http_status: int | None = None,
+        body: str | None = None,
+    ) -> None:
         msg = (
             f'Received no resource length from "{url}"'
             if url == redirect_url
             else f'Received no resource length from "{redirect_url}" redirected from "{url}"'
         )
-        super().__init__(msg)
+        if http_status is not None:
+            msg += f" (HTTP {http_status})"
+        super().__init__(
+            msg,
+            stage="Download size",
+            url=redirect_url,
+            http_status=http_status,
+            hint=status_hint(http_status),
+            body_snippet=body,
+        )
 
 
 def get_new_home_url_from_readme(site_name: str) -> str:
@@ -103,7 +125,21 @@ def get_new_home_url_from_readme(site_name: str) -> str:
     :param site_name: Can be either Animepahe or Gogoanime.
     :return: The new home url.
     """
-    encoded_readme_text = CLIENT.get(GITHUB_API_README_URL).json()["content"]
+    readme_json = check_response(
+        CLIENT.get(GITHUB_API_README_URL),
+        f"GitHub README lookup (new {site_name} domain)",
+        expect_json=True,
+        url=GITHUB_API_README_URL,
+    )
+    encoded_readme_text = readme_json.get("content") if isinstance(readme_json, dict) else None
+    if not encoded_readme_text:
+        raise SenpError(
+            "The GitHub README reply had no 'content' field",
+            stage=f"GitHub README lookup (new {site_name} domain)",
+            url=GITHUB_API_README_URL,
+            hint="GitHub's API may have changed or be rate limiting this IP.",
+            body_snippet=str(readme_json)[:2000],
+        )
     readme_text = b64decode(encoded_readme_text).decode("utf-8")
     match = re.search(rf"\[{site_name}\]\((.*)\)", readme_text)
     if match is None:
@@ -118,7 +154,11 @@ class DomainNameError(Exception):
     message = "The domain might have changed"
 
     def __init__(self, original_exception: Exception) -> None:
-        super().__init__(DomainNameError.message, original_exception)
+        # One formatted string: with the original as a second arg, str() of this
+        # rendered as a tuple repr.
+        super().__init__(
+            f"{DomainNameError.message}: {describe_exception(original_exception)}"
+        )
         self.original_exception = original_exception
 
 
@@ -486,6 +526,12 @@ class Download(ProgressFunction):
             impersonate=impersonate,
         )
         redirect_url = response.url
+        if response.status_code >= 400:
+            # Without this a 403 block page that happens to carry a Content-Length is
+            # taken for the episode and "downloaded" as a tiny broken file.
+            raise NoResourceLengthException(
+                url, redirect_url, response.status_code, body_snippet(response)
+            )
         resource_length_str = response.headers.get("Content-Length", None)
         if resource_length_str is not None:
             return (int(resource_length_str), redirect_url)
@@ -508,7 +554,12 @@ class Download(ProgressFunction):
             total = content_range.rsplit("/", 1)[-1].strip()
             if total.isdigit():
                 return (int(total), redirect_url)
-        raise NoResourceLengthException(url, redirect_url)
+        raise NoResourceLengthException(
+            url,
+            redirect_url,
+            range_response.status_code,
+            body_snippet(range_response) if range_response.status_code >= 400 else None,
+        )
 
     def cancel(self):
         return super().cancel()
@@ -590,11 +641,23 @@ class Download(ProgressFunction):
                     cookies=self.cookies,
                     impersonate=impersonate,
                 )
+                if not response.ok:
+                    # Used to fall out of the loop below silently, then recurse into
+                    # another request because the file was still short, until
+                    # RecursionError. Say what the server actually answered.
+                    raise SenpError(
+                        f"Download request was refused: HTTP {response.status_code}",
+                        stage="Download",
+                        url=self.link_or_segment_urls,
+                        http_status=response.status_code,
+                        hint=status_hint(response.status_code),
+                        body_snippet=body_snippet(response),
+                    )
                 iter_content = cast(
                     Iterator[bytes],
                     response.iter_content(chunk_size=IBYTES_TO_MBS_DIVISOR),
                 )
-                while response.ok:
+                while True:
                     try:
                         downloaded_data = CLIENT.network_error_retry_wrapper(
                             lambda: next(iter_content)

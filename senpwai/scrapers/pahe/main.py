@@ -13,6 +13,13 @@ from requests.exceptions import RequestException as HttpRequestException
 NETWORK_EXCEPTIONS = (CurlRequestException, HttpRequestException)
 
 logger = logging.getLogger(__name__)
+from senpwai.common.errors import (
+    BODY_SNIPPET_CHARS,
+    SenpError,
+    body_snippet,
+    check_response,
+    describe_exception,
+)
 from senpwai.common.scraper import (
     CLIENT,
     PARSER,
@@ -60,6 +67,9 @@ Also it seems currently only __ddg2_ is necessary
 
 MAX_RATE_LIMIT_RETRIES = 6
 RATE_LIMIT_BACKOFF_SECONDS = 5
+# How many times to force a FlareSolverr refresh when a request still comes back as a
+# Cloudflare challenge. Without a cap a persistent challenge loops forever.
+MAX_CF_CHALLENGE_RETRIES = 3
 # curl_cffi defaults to a flat 30s timeout. Split it so an unreachable host fails fast
 # instead of burning the full budget. The read half stays at curl's default, which is
 # evidently enough for requests that work at all — the failure mode here is a hang,
@@ -82,12 +92,22 @@ MAX_EMPTY_PAGE_RETRIES = 3
 EMPTY_PAGE_BACKOFF_SECONDS = 4
 
 
-def site_request(url: str, allow_redirects=True, _rate_limit_retries=0, _network_retries=0):
+def site_request(
+    url: str,
+    allow_redirects=True,
+    _rate_limit_retries=0,
+    _network_retries=0,
+    _cf_retries=0,
+):
     """
     For requests that go specifically to the animepahe domain.
     Uses FlareSolverr-obtained cf_clearance cookies + curl_cffi Chrome impersonation
     to bypass Cloudflare's JS challenge. Retries with backoff on HTTP 429 (rate limit)
     and on transient network failures such as a read timeout.
+
+    Raises ``SenpError`` once the network or Cloudflare retries are exhausted. A 429 that
+    outlasts its retries is still *returned*; run it through ``check_response`` to turn
+    it into a readable error.
     """
     global FIRST_REQUEST, PAHE_HOME_URL
     logger.debug("site_request: GET %s (allow_redirects=%s)", url, allow_redirects)
@@ -122,20 +142,28 @@ def site_request(url: str, allow_redirects=True, _rate_limit_retries=0, _network
         COOKIES.update(dict(response.cookies))
     except DomainNameError:
         PAHE_HOME_URL = get_new_home_url_from_readme(FULL_SITE_NAME)
-        return site_request(url)
+        return site_request(url, allow_redirects)
     except CurlRequestException as e:
         # A timeout or dropped connection mid-batch would otherwise abort the entire
         # download resolve, losing every episode already fetched.
         if _network_retries >= MAX_NETWORK_RETRIES:
             logger.error("Network error on %s after %d retries — giving up: %s", url, _network_retries, e)
-            raise
+            raise SenpError(
+                f"Animepahe request failed after {_network_retries + 1} attempts: {e}",
+                stage="Animepahe request",
+                url=url,
+                attempts=_network_retries + 1,
+                hint="The site may be down or slow. Check that animepahe.pw opens in a browser.",
+            ) from e
         wait = NETWORK_BACKOFF_SECONDS * (_network_retries + 1)
         logger.warning(
             "Network error on %s (%s) — waiting %ss then retrying (attempt %d)",
             url, e, wait, _network_retries + 1,
         )
         time.sleep(wait)
-        return site_request(url, allow_redirects, _rate_limit_retries, _network_retries + 1)
+        return site_request(
+            url, allow_redirects, _rate_limit_retries, _network_retries + 1, _cf_retries
+        )
 
     logger.debug(
         "site_request: status=%s url=%s content-type=%s body[:300]=%r",
@@ -146,9 +174,25 @@ def site_request(url: str, allow_redirects=True, _rate_limit_retries=0, _network
     )
 
     if response.status_code == 403 and b"Just a moment" in response.content:
+        if _cf_retries >= MAX_CF_CHALLENGE_RETRIES:
+            raise SenpError(
+                f"Animepahe is still serving a Cloudflare challenge after "
+                f"{_cf_retries} FlareSolverr refreshes",
+                stage="Cloudflare",
+                url=url,
+                http_status=403,
+                attempts=_cf_retries + 1,
+                hint=(
+                    "FlareSolverr solved the challenge but Cloudflare rejected the result. "
+                    "Updating or restarting FlareSolverr usually fixes this."
+                ),
+                body_snippet=body_snippet(response),
+            )
         logger.warning("Cloudflare challenge still active — forcing FlareSolverr refresh")
         get_pahe_session(force_refresh=True)
-        return site_request(url, allow_redirects)
+        return site_request(
+            url, allow_redirects, _rate_limit_retries, _network_retries, _cf_retries + 1
+        )
 
     # Animepahe rate-limits rapid sequential requests with HTTP 429.
     # Back off and retry instead of letting the caller silently drop the episode.
@@ -160,7 +204,9 @@ def site_request(url: str, allow_redirects=True, _rate_limit_retries=0, _network
         wait = int(retry_after) if retry_after and retry_after.isdigit() else RATE_LIMIT_BACKOFF_SECONDS * (_rate_limit_retries + 1)
         logger.warning("Rate limited (429) on %s — waiting %ss then retrying (attempt %d)", url, wait, _rate_limit_retries + 1)
         time.sleep(wait)
-        return site_request(url, allow_redirects, _rate_limit_retries + 1)
+        return site_request(
+            url, allow_redirects, _rate_limit_retries + 1, _network_retries, _cf_retries
+        )
 
     return response
 
@@ -168,12 +214,10 @@ def site_request(url: str, allow_redirects=True, _rate_limit_retries=0, _network
 def search(keyword: str) -> list[dict[str, str]]:
     search_url = f"{API_ENTRY_POINT}search&q={keyword}"
     response = site_request(search_url)
-    if not response.content:
-        raise RuntimeError(
-            f"Empty response from Animepahe search (HTTP {response.status_code}). "
-            "The site may be down or the domain may have changed."
-        )
-    results_json = cast(dict, response.json())
+    results_json = cast(
+        dict,
+        check_response(response, "Animepahe search", expect_json=True, url=search_url),
+    )
     # The search api endpoint won't return json containing the data key if no results are found
     return results_json.get("data", [])
 
@@ -208,7 +252,20 @@ def get_episode_pages_info(
     anime_page_link: str, start_episode: int, end_episode: int
 ) -> EpisodePagesInfo:
     page_url = LOAD_EPISODES_URL.format(anime_page_link, 1)
-    first_page_json = site_request(page_url).json()
+    first_page_json = check_response(
+        site_request(page_url),
+        "Animepahe episode list (page 1)",
+        expect_json=True,
+        url=page_url,
+    )
+    if "per_page" not in first_page_json:
+        raise SenpError(
+            "Animepahe episode list had no 'per_page' field",
+            stage="Animepahe episode list",
+            url=page_url,
+            hint="The site's API may have changed.",
+            body_snippet=str(first_page_json)[:BODY_SNIPPET_CHARS],
+        )
     per_page: int = first_page_json["per_page"]
     start_page_num = math.ceil(start_episode / per_page)
     end_page_num = math.ceil(end_episode / per_page)
@@ -278,7 +335,12 @@ class GetEpisodePageLinks(ProgressFunction):
                 progress_update_callback(1)
         for page_num in range(start_page_num, end_page_num + 1):
             page_url = LOAD_EPISODES_URL.format(anime_page_link, page_num)
-            page_json = site_request(page_url).json()
+            page_json = check_response(
+                site_request(page_url),
+                f"Animepahe episode list (page {page_num})",
+                expect_json=True,
+                url=page_url,
+            )
             # To avoid episodes like 7.5 and 5.5 cause they're usually just recaps
             episodes = [
                 ep for ep in page_json["data"] if isinstance(ep["episode"], int)
@@ -319,21 +381,28 @@ class GetPahewinPageLinks(ProgressFunction):
         BeautifulSoup ``find_all`` result (empty list if it genuinely has no links),
         paired with a reason string describing why it is empty.
         """
+        attempts = MAX_EMPTY_PAGE_RETRIES + 1
+        # Rebuilt every attempt, so the final reason describes the *last* failure
+        # instead of a stale one from an earlier attempt.
         reason = "no download links on the episode page"
-        for attempt in range(MAX_EMPTY_PAGE_RETRIES + 1):
+        for attempt in range(attempts):
             try:
-                page_content = site_request(episode_page_link, allow_redirects=True).content
-            except NETWORK_EXCEPTIONS as e:
+                response = site_request(episode_page_link, allow_redirects=True)
+            except (*NETWORK_EXCEPTIONS, SenpError) as e:
                 # site_request already retried this; treat a still-failing request the
                 # same as an empty page so one bad episode doesn't abort the whole
                 # resolve and discard every episode fetched before it.
                 logger.warning("Request failed for %s (attempt %d): %s", episode_page_link, attempt + 1, e)
                 page_content = b""
                 pahewin_data = []
-                reason = f"request failed: {e}"
+                reason = f"request failed: {describe_exception(e)}"
             else:
+                page_content = response.content
                 soup = BeautifulSoup(page_content, PARSER)
                 pahewin_data = soup.find_all("a", class_="dropdown-item", target="_blank")
+                reason = f"no download links on the episode page (HTTP {response.status_code})"
+                if response.status_code == 429:
+                    reason = "rate limited by Animepahe (HTTP 429)"
             if pahewin_data:
                 return pahewin_data, ""
             if b"Just a moment" in page_content:
@@ -347,7 +416,7 @@ class GetPahewinPageLinks(ProgressFunction):
                     episode_page_link, attempt + 1, wait,
                 )
                 time.sleep(wait)
-        return [], reason
+        return [], f"{reason}, after {attempts} attempts: {episode_page_link}"
 
     def get_pahewin_page_links_and_info(
         self,
@@ -381,7 +450,12 @@ def is_dub(episode_download_info: str) -> bool:
 
 def dub_available(anime_page_link: str, anime_id: str) -> bool:
     page_url = LOAD_EPISODES_URL.format(anime_page_link, 1)
-    page_json = site_request(page_url).json()
+    page_json = check_response(
+        site_request(page_url),
+        "Animepahe dub check (episode list page 1)",
+        expect_json=True,
+        url=page_url,
+    )
     episodes_data = page_json.get("data", None)
     if episodes_data is None:
         return False
@@ -517,10 +591,13 @@ class GetDirectDownloadLinks(ProgressFunction):
             ).text
             kwik_page_match = KWIK_PAGE_REGEX.search(pahewin_html_page)
             if kwik_page_match is None:
-                raise RuntimeError(
-                    f"Couldn't find a kwik.cx link on {pahewin_link} "
-                    f"(page snippet: {pahewin_html_page[:200]!r}) "
-                    "after refreshing CF clearance."
+                raise SenpError(
+                    "Couldn't find a kwik.cx link on the pahe.win page "
+                    "after refreshing Cloudflare clearance",
+                    stage="pahe.win page",
+                    url=pahewin_link,
+                    hint="pahe.win may still be blocking us, or its page layout changed.",
+                    body_snippet=pahewin_html_page[:BODY_SNIPPET_CHARS],
                 )
         kwik_page_link = kwik_page_match.group()
 
@@ -537,9 +614,14 @@ class GetDirectDownloadLinks(ProgressFunction):
             response = kwik_session.get(kwik_page_link, timeout=KWIK_TIMEOUT_SECONDS)
             match = PARAM_REGEX.search(response.text)
             if match is None:
-                raise RuntimeError(
-                    f"Failed to extract kwik params from {kwik_page_link} "
-                    f"(status={response.status_code}) after refreshing CF clearance."
+                raise SenpError(
+                    "Failed to extract the download parameters from the kwik page "
+                    "after refreshing Cloudflare clearance",
+                    stage="kwik page",
+                    url=kwik_page_link,
+                    http_status=response.status_code,
+                    hint="kwik.cx may still be blocking us, or its page layout changed.",
+                    body_snippet=response.text[:BODY_SNIPPET_CHARS],
                 )
         full_key, key, v1, v2 = (
             match.group(1),
@@ -547,8 +629,24 @@ class GetDirectDownloadLinks(ProgressFunction):
             match.group(3),
             match.group(4),
         )
-        form = decrypt_post_form(full_key, key, int(v1), int(v2))
+        try:
+            form = decrypt_post_form(full_key, key, int(v1), int(v2))
+        except (IndexError, ValueError) as e:
+            raise SenpError(
+                f"Couldn't decode the kwik download form ({describe_exception(e)})",
+                stage="kwik form",
+                url=kwik_page_link,
+                hint="kwik.cx probably changed how it obfuscates the form.",
+            ) from e
         soup = BeautifulSoup(form, PARSER)
+        if soup.form is None or soup.input is None:
+            raise SenpError(
+                "The decoded kwik form had no <form> or <input> element",
+                stage="kwik form",
+                url=kwik_page_link,
+                hint="kwik.cx probably changed its form.",
+                body_snippet=form[:BODY_SNIPPET_CHARS],
+            )
         post_url = cast(str, cast(Tag, soup.form)["action"])
         token_value = cast(str, cast(Tag, soup.input)["value"])
         response = kwik_session.post(
@@ -558,7 +656,17 @@ class GetDirectDownloadLinks(ProgressFunction):
             allow_redirects=False,
             timeout=KWIK_TIMEOUT_SECONDS,
         )
-        return response.headers["Location"]
+        location = response.headers.get("Location")
+        if not location:
+            raise SenpError(
+                "kwik did not redirect to a download link",
+                stage="kwik redirect",
+                url=post_url,
+                http_status=response.status_code,
+                hint="The token may have expired, or kwik is rate limiting.",
+                body_snippet=response.text[:BODY_SNIPPET_CHARS],
+            )
+        return location
 
     def resolve_one(self, pahewin_link: str) -> str:
         """Resolve a single pahe.win link to a direct download link.
@@ -586,12 +694,12 @@ class GetDirectDownloadLinks(ProgressFunction):
             for name, value in pahewin_cf["cookies"].items():
                 pahewin_session.cookies.set(name, value, domain=".pahe.win")
 
-            last_error: Exception | None = None
+            errors: list[Exception] = []
             for attempt in range(MAX_KWIK_RETRIES + 1):
                 try:
                     return self._resolve_one(kwik_session, pahewin_session, pahewin_link)
                 except Exception as e:
-                    last_error = e
+                    errors.append(e)
                     if attempt < MAX_KWIK_RETRIES:
                         wait = KWIK_BACKOFF_SECONDS * (attempt + 1)
                         logger.warning(
@@ -599,8 +707,22 @@ class GetDirectDownloadLinks(ProgressFunction):
                             pahewin_link, attempt + 1, e, wait,
                         )
                         time.sleep(wait)
-            assert last_error is not None
-            raise last_error
+            last = errors[-1]
+            # Only the last error used to survive, hiding that earlier attempts may
+            # have failed differently (e.g. a timeout, then a Cloudflare block).
+            hint = getattr(last, "hint", None) or ""
+            history = "\n".join(
+                f"  attempt {i}: {describe_exception(err)}" for i, err in enumerate(errors, 1)
+            )
+            raise SenpError(
+                f"{describe_exception(last)} (gave up after {len(errors)} attempts)",
+                stage=getattr(last, "stage", None) or "pahe.win / kwik",
+                url=getattr(last, "url", None) or pahewin_link,
+                http_status=getattr(last, "http_status", None),
+                attempts=len(errors),
+                hint=f"{hint}\n\nAttempts:\n{history}".strip(),
+                body_snippet=getattr(last, "body_snippet", None),
+            ) from last
         finally:
             kwik_session.close()
             pahewin_session.close()
@@ -629,7 +751,7 @@ class GetDirectDownloadLinks(ProgressFunction):
                 # Record and move on rather than aborting the whole resolve and
                 # discarding every episode already resolved.
                 logger.error("Giving up on %s: %s", pahewin_link, e)
-                self.skipped.append((idx, str(e)))
+                self.skipped.append((idx, describe_exception(e)))
             self.resume.wait()
             if self.cancelled:
                 return []
@@ -640,8 +762,9 @@ class GetDirectDownloadLinks(ProgressFunction):
 
 def get_anime_metadata(anime_id: str) -> AnimeMetadata:
     page_link = f"{PAHE_HOME_URL}/anime/{anime_id}"
-    page_content = site_request(page_link, allow_redirects=True).content
-    soup = BeautifulSoup(page_content, PARSER)
+    page_response = site_request(page_link, allow_redirects=True)
+    check_response(page_response, "Animepahe anime page", url=page_link)
+    soup = BeautifulSoup(page_response.content, PARSER)
     poster = soup.find(class_="youtube-preview")
     if not isinstance(poster, Tag):
         poster = cast(Tag, soup.find(class_="poster-image"))
@@ -661,7 +784,12 @@ def get_anime_metadata(anime_id: str) -> AnimeMetadata:
     )
     _, release_year = season_and_year.split(" ")
     page_link = ANIME_PAGE_URL.format(anime_id)
-    page_json = site_request(page_link).json()
+    page_json = check_response(
+        site_request(page_link),
+        "Animepahe episode count",
+        expect_json=True,
+        url=page_link,
+    )
     episode_count = page_json["total"]
     tag = soup.find(title="Currently Airing")
     if tag:

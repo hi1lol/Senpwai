@@ -17,6 +17,8 @@ from typing import TypedDict
 import requests
 from appdirs import user_config_dir
 
+from senpwai.common.errors import BODY_SNIPPET_CHARS, SenpError, check_response
+
 CACHE_TTL_SECONDS = 20 * 60
 # Ceiling on how long a solved session is trusted, even if the cookie claims longer.
 MAX_CACHE_TTL_SECONDS = 12 * 60 * 60
@@ -133,26 +135,80 @@ def _solve_via_flaresolverr(flaresolverr_url: str, probe_url: str, domain: str) 
             json={"cmd": "request.get", "url": probe_url, "maxTimeout": 60000},
             timeout=90,
         )
-    except requests.exceptions.ConnectionError:
-        raise RuntimeError(
-            f"Could not connect to FlareSolverr at {endpoint}.\n"
-            "Make sure it is running, e.g.:\n"
-            "  docker run -d --name=flaresolverr -p 8191:8191 "
-            "ghcr.io/flaresolverr/flaresolverr:latest"
-        )
+    except requests.exceptions.ConnectionError as e:
+        raise SenpError(
+            f"Could not connect to FlareSolverr at {endpoint}",
+            stage="FlareSolverr",
+            url=endpoint,
+            hint=(
+                "Make sure FlareSolverr is running, e.g.:\n"
+                "  docker run -d --name=flaresolverr -p 8191:8191 "
+                "ghcr.io/flaresolverr/flaresolverr:latest\n"
+                "Or point FLARESOLVERR_URL at the instance you already have."
+            ),
+        ) from e
+    except requests.exceptions.Timeout as e:
+        raise SenpError(
+            f"FlareSolverr at {endpoint} did not answer within 90 seconds",
+            stage="FlareSolverr",
+            url=endpoint,
+            hint=f"It was asked to solve {probe_url}. Check the FlareSolverr container's logs.",
+        ) from e
 
     if resp.status_code != 200:
-        raise RuntimeError(
-            f"FlareSolverr returned HTTP {resp.status_code}: {resp.text[:300]}"
+        # FlareSolverr explains itself in a JSON body ({"status": "error", "message":
+        # ...}). Surface that instead of leaving the actual reason buried in the raw body.
+        reason: str | None = None
+        version: str | None = None
+        try:
+            body = resp.json()
+            reason = str(body.get("message") or "").removeprefix("Error: ").strip() or None
+            version = body.get("version")
+        except (ValueError, AttributeError):
+            pass
+        hint = None
+        if reason and "timeout" in reason.lower():
+            hint = (
+                f"Cloudflare did not let FlareSolverr through to {probe_url} in time. "
+                "This is often temporary: try again in a minute. If it keeps happening, "
+                "update FlareSolverr (e.g. `docker compose pull flaresolverr`) and check "
+                "its container logs."
+            )
+        raise SenpError(
+            f"FlareSolverr returned HTTP {resp.status_code}"
+            + (f": {reason}" if reason else ""),
+            stage="FlareSolverr",
+            url=endpoint,
+            http_status=resp.status_code,
+            hint=hint,
+            body_snippet=resp.text[:BODY_SNIPPET_CHARS],
+            details={
+                "Asked FlareSolverr to open": probe_url,
+                **({"FlareSolverr version": str(version)} if version else {}),
+            },
         )
 
-    data = resp.json()
+    # Not a bare resp.json(): a reverse proxy or a crashed FlareSolverr can answer 200
+    # with something that isn't JSON, and that failure should show the reply and its URL.
+    data = check_response(
+        resp, "FlareSolverr reply", expect_json=True, url=endpoint
+    )
     if data.get("status") != "ok":
-        raise RuntimeError(
-            f"FlareSolverr failed to solve the challenge: {data.get('message', data)}"
+        raise SenpError(
+            f"FlareSolverr failed to solve the challenge: {data.get('message', data)}",
+            stage="FlareSolverr",
+            url=probe_url,
+            hint="The site may be down, or its Cloudflare challenge changed. Updating FlareSolverr often fixes this.",
         )
 
-    solution = data["solution"]
+    solution = data.get("solution") or {}
+    if "userAgent" not in solution:
+        raise SenpError(
+            "FlareSolverr's reply had no solution/userAgent",
+            stage="FlareSolverr",
+            url=probe_url,
+            body_snippet=json.dumps(data)[:BODY_SNIPPET_CHARS],
+        )
     user_agent: str = solution["userAgent"]
     solution_cookies = solution.get("cookies", [])
     cookies = {

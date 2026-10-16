@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import sys
 import threading
 import time
 import uuid
@@ -13,21 +14,57 @@ import webbrowser
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
-
-logging.basicConfig(level=logging.DEBUG)
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from senpwai.common.classes import SETTINGS, Anime, AnimeDetails
+from senpwai.common.errors import (
+    ErrorInfo,
+    SenpError,
+    check_response,
+    describe_exception,
+    log_error,
+)
 from senpwai.common.scraper import CLIENT
 from senpwai.common.static import DUB, GOGO, PAHE
 from senpwai.common.tracker import check_tracked_anime
 from senpwai.scrapers import gogo, pahe
 from senpwai.webui.queue_manager import QUEUE_MANAGER, QueueItem
+
+def _setup_logging() -> None:
+    """Log to errors.log and stderr, once.
+
+    Creating SETTINGS already attached an ERROR-level file handler to the root logger
+    (Settings.setup_logger), so drop it first or every ERROR line is written twice. This
+    used to be pre-empted by a module-level basicConfig(DEBUG) that ran before SETTINGS
+    existed, which made setup_logger a no-op and left errors.log empty for the web UI.
+    Set SENPWEB_LOG_LEVEL=DEBUG to also log every request's response body.
+    """
+    root = logging.getLogger()
+    for handler in root.handlers[:]:
+        root.removeHandler(handler)
+        handler.close()
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s")
+    file_handler = RotatingFileHandler(
+        os.path.join(SETTINGS.config_dir, "errors.log"),
+        maxBytes=2 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    for handler in (file_handler, logging.StreamHandler(sys.stderr)):
+        handler.setFormatter(formatter)
+        root.addHandler(handler)
+    level_name = os.environ.get("SENPWEB_LOG_LEVEL", "INFO").upper()
+    root.setLevel(getattr(logging, level_name, logging.INFO))
+
+
+_setup_logging()
 
 # Set SENPWEB_BROWSER_ONLY=1 to disable server-side queue downloads
 BROWSER_ONLY: bool = os.environ.get("SENPWEB_BROWSER_ONLY", "").strip() in ("1", "true", "yes")
@@ -45,12 +82,22 @@ _tracking_events: deque[dict] = deque(maxlen=30)
 _tracking_events_lock = threading.Lock()
 
 
-def _add_tracking_event(kind: str, message: str) -> None:
+def _add_tracking_event(kind: str, message: str, detail: dict | None = None) -> None:
     with _tracking_events_lock:
-        _tracking_events.append({"time": time.time(), "kind": kind, "message": message})
+        _tracking_events.append(
+            {"time": time.time(), "kind": kind, "message": message, "detail": detail}
+        )
 
 
 def _run_tracking_check() -> None:
+    def on_error(title: str, e: Exception) -> None:
+        log_error("Tracking check failed for %s", e, title)
+        _add_tracking_event(
+            "error",
+            f"{title}: {describe_exception(e)}",
+            ErrorInfo.from_exception(e, stage="tracking check").to_dict(),
+        )
+
     def start_download(anime_details: AnimeDetails) -> None:
         item = QueueItem(
             job_id=uuid.uuid4().hex,
@@ -80,6 +127,7 @@ def _run_tracking_check() -> None:
             "queued", f"Queued new episodes for {titles}"
         ),
         start_downloading_immediately=True,
+        error_callback=on_error,
     )
 
 
@@ -88,7 +136,17 @@ async def _tracking_scheduler_loop() -> None:
     while True:
         await asyncio.sleep(SETTINGS.tracking_interval_hrs * 3600)
         if SETTINGS.tracked_anime:
-            await loop.run_in_executor(None, _run_tracking_check)
+            try:
+                await loop.run_in_executor(None, _run_tracking_check)
+            except Exception as e:
+                # An uncaught error here would end this task, silently stopping
+                # tracking until the server restarts.
+                log_error("Scheduled tracking check failed", e)
+                _add_tracking_event(
+                    "error",
+                    f"Scheduled check failed: {describe_exception(e)}",
+                    ErrorInfo.from_exception(e, stage="tracking check").to_dict(),
+                )
 
 
 @asynccontextmanager
@@ -100,6 +158,49 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Senpweb", lifespan=lifespan)
+
+
+# Every error response is {"detail": <one readable line>, "error": <ErrorInfo dict>|null},
+# so the page can show the summary and offer the rest behind a Details toggle.
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    lines = []
+    for err in exc.errors():
+        field = ".".join(str(part) for part in err.get("loc", ()) if part != "body")
+        msg = err.get("msg", "invalid value")
+        lines.append(f"{field}: {msg}" if field else msg)
+    return JSONResponse(
+        status_code=422,
+        content={"detail": "\n".join(lines) or "Invalid request", "error": None},
+    )
+
+
+def _error_response(request: Request, exc: Exception, status_code: int) -> JSONResponse:
+    where = f"{request.method} {request.url.path}"
+    log_error("%s failed", exc, where)
+    info = ErrorInfo.from_exception(exc, stage=where)
+    return JSONResponse(
+        status_code=status_code,
+        content={"detail": info.summary, "error": info.to_dict()},
+    )
+
+
+# A SenpError is a failure talking to something upstream (the site, FlareSolverr, a
+# CDN), not a bug in this server, hence 502. It gets its own handler because Starlette
+# re-raises whatever the catch-all Exception handler dealt with, so uvicorn would
+# print a second "Exception in ASGI application" traceback for every one of them.
+@app.exception_handler(SenpError)
+async def upstream_error_handler(request: Request, exc: SenpError) -> JSONResponse:
+    return _error_response(request, exc, 502)
+
+
+@app.exception_handler(Exception)
+async def unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    return _error_response(request, exc, 500)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -416,7 +517,7 @@ class BrowserDownloadRequest(BaseModel):
     sub_or_dub: str = ""
 
 
-def _resolve_browser_download(req: BrowserDownloadRequest) -> list[dict]:
+def _resolve_browser_download(req: BrowserDownloadRequest) -> dict:
     item = QueueItem(
         job_id="browser-" + uuid.uuid4().hex,
         anime_title=req.title,
@@ -433,13 +534,38 @@ def _resolve_browser_download(req: BrowserDownloadRequest) -> list[dict]:
     anime_details = AnimeDetails(anime, PAHE)
     ddls = QUEUE_MANAGER._resolve_pahe(item, anime_details)
 
+    # Episodes whose link couldn't be resolved are recorded on the throwaway item;
+    # dropping them silently used to hand back a shorter list, or an empty zip.
+    skipped = [
+        {
+            "title": ep.episode_title,
+            "episode_number": ep.episode_number,
+            "reason": ep.error,
+        }
+        for ep in item.episodes
+        if ep.status == "skipped"
+    ]
+    if not ddls:
+        if skipped:
+            raise SenpError(
+                f"Could not resolve a download link for any of the {len(skipped)} "
+                "requested episode(s)",
+                stage="browser download",
+                hint="\n".join(f"{s['title']}: {s['reason']}" for s in skipped),
+            )
+        raise SenpError(
+            "No episodes to download — the server already has them all, "
+            "or the range was empty",
+            stage="browser download",
+        )
+
     episodes = []
     for i, url in enumerate(ddls):
         token = uuid.uuid4().hex
         title = anime_details.episode_title(i, False)
         _browser_dl_store[token] = {"url": url, "title": title}
         episodes.append({"token": token, "title": title})
-    return episodes
+    return {"episodes": episodes, "skipped": skipped}
 
 
 @app.get("/api/proxy-image")
@@ -490,8 +616,7 @@ async def proxy_image(url: str, request: Request) -> Response:
 @app.post("/api/browser-download/resolve")
 async def resolve_browser_download(req: BrowserDownloadRequest) -> dict:
     loop = asyncio.get_running_loop()
-    episodes = await loop.run_in_executor(None, _resolve_browser_download, req)
-    return {"episodes": episodes}
+    return await loop.run_in_executor(None, _resolve_browser_download, req)
 
 
 @app.get("/api/browser-download/{token}")
@@ -500,7 +625,7 @@ async def browser_download_file(token: str) -> StreamingResponse:
     if info is None:
         raise HTTPException(status_code=404, detail="Token not found or expired")
 
-    def stream():
+    def open_cdn_stream():
         # info["url"] is still a pahe.win page link (resolve was deferred just-in-time,
         # see the comment in queue_manager._resolve_pahe) — resolve it to the actual
         # owocdn/kwik direct link now, right before streaming, the same way
@@ -516,8 +641,25 @@ async def browser_download_file(token: str) -> StreamingResponse:
             headers={"Referer": pahe.KWIK_REFERER},
             impersonate="chrome",
         )
-        for chunk in resp.iter_content(chunk_size=1024 * 1024):
-            yield chunk
+        try:
+            check_response(resp, "Download from CDN")
+        except Exception:
+            resp.close()
+            raise
+        return resp
+
+    # Resolve and connect *before* building the response. Once StreamingResponse has
+    # sent its 200 headers a failure can only reset the connection, so the page would
+    # see a network error with no reason (and a 403 block page streamed as .mp4).
+    loop = asyncio.get_running_loop()
+    resp = await loop.run_in_executor(None, open_cdn_stream)
+
+    def stream():
+        try:
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                yield chunk
+        finally:
+            resp.close()
 
     filename = f"{info['title']}.mp4"
     return StreamingResponse(

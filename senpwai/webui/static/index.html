@@ -129,8 +129,13 @@
     /* Job card */
     .job-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
     .job-header { display: flex; align-items: center; gap: 8px; padding: 10px 14px; flex-wrap: wrap; }
-    .job-title { flex: 1; min-width: 0; font-weight: 600; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .job-meta { display: flex; gap: 6px; align-items: center; }
+    /* A 180px floor on the flex-basis: with `flex: 1` alone the title could shrink to
+       nothing ("E…") before the buttons wrapped onto their own row. */
+    .job-title { flex: 1 1 180px; min-width: 0; font-weight: 600; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    /* Wraps: with several buttons (Retry, Retry N episodes, Remove) a failed job's
+       header is wider than a phone, and .job-card's overflow:hidden clipped the rest. */
+    .job-meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; min-width: 0; }
+    .job-range { color: var(--muted); font-size: 12px; white-space: nowrap; }
     .job-body { padding: 0 14px 12px; }
 
     /* Progress bars */
@@ -143,14 +148,11 @@
 
     .ep-list { display: flex; flex-direction: column; gap: 6px; }
     .ep-row { font-size: 12px; }
-    .ep-reason {
-      color: var(--muted); font-size: 11px; margin-top: 2px;
-      overflow-wrap: anywhere;
-    }
     .ep-summary {
       margin-top: 8px; font-size: 12px; color: var(--warn);
     }
-    .ep-name { color: var(--muted); margin-bottom: 3px; display: flex; justify-content: space-between; }
+    .ep-name { color: var(--muted); margin-bottom: 3px; display: flex; justify-content: space-between; gap: 8px; min-width: 0; }
+    .ep-name > span:first-child { min-width: 0; overflow-wrap: anywhere; }
     .ep-name span { color: var(--text); }
     progress.ep-bar { height: 5px; }
     progress.ep-bar::-webkit-progress-value { background: var(--cyan); }
@@ -158,7 +160,43 @@
     progress.ep-done::-webkit-progress-value { background: var(--success); }
     progress.ep-done::-moz-progress-bar { background: var(--success); }
 
-    .error-msg { color: var(--error); font-size: 12px; margin-top: 6px; background: #2a0a0a; border-radius: 6px; padding: 6px 10px; word-break: break-word; }
+    /* Errors: a wrapped one-line summary, with everything else behind "Details".
+       Nothing here truncates; long text wraps and long blocks scroll. */
+    .err { color: var(--error); font-size: 12px; margin-top: 6px; background: #2a0a0a; border-radius: 6px; padding: 8px 10px; min-width: 0; }
+    .err.warn { color: var(--warn); background: #2a1c06; }
+    .err-summary { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.45; }
+    .err-details { margin: 6px 0 0; }
+    .err-details summary { font-size: 11px; font-weight: 500; color: var(--muted); padding: 2px 0; }
+    .err-body { margin-top: 6px; color: var(--text); }
+    .err-grid { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 10px; font-size: 11px; }
+    .err-grid dt { color: var(--muted); }
+    .err-grid dd { white-space: pre-wrap; overflow-wrap: anywhere; }
+    .err-label { margin-top: 8px; font-size: 11px; color: var(--muted); }
+    .err-pre {
+      margin-top: 3px; max-height: 260px; overflow: auto;
+      background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px;
+      font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+      white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text);
+    }
+    .err-actions { margin-top: 8px; }
+    .conn-note { color: var(--warn); font-size: 11px; margin-top: 6px; }
+
+    /* Toasts: errors stay until dismissed, success messages fade out. */
+    #toasts {
+      position: fixed; right: 16px; bottom: 16px; z-index: 200;
+      width: min(560px, calc(100vw - 32px)); max-height: calc(100vh - 80px);
+      display: flex; flex-direction: column; gap: 8px; overflow-y: auto; pointer-events: none;
+    }
+    .toast {
+      pointer-events: auto; display: flex; align-items: flex-start; gap: 8px;
+      background: var(--card); border: 1px solid var(--border); border-left: 4px solid var(--cyan);
+      border-radius: 8px; padding: 10px 12px; font-size: 13px; box-shadow: 0 4px 16px rgba(0,0,0,.4);
+    }
+    .toast.error { border-left-color: var(--error); }
+    .toast.success { border-left-color: var(--success); }
+    .toast-body { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+    .toast-body .err { margin-top: 0; padding: 0; background: transparent; }
+    .toast-close { background: transparent; color: var(--muted); padding: 0 4px; font-size: 18px; line-height: 1; }
 
     /* Settings */
     details { margin-bottom: 16px; }
@@ -217,6 +255,8 @@
   <!-- Details panel -->
   <div class="card" id="details-panel">
     <div id="details-loading"><span class="spinner"></span> Fetching details...</div>
+    <!-- Separate from #details-content so a failed fetch can't wipe the form. -->
+    <div id="details-error"></div>
     <div id="details-content" style="display:none">
       <div class="details-inner">
         <div class="details-poster"><img id="poster-img" src="" alt="poster"></div>
@@ -326,6 +366,8 @@
   </details>
 </main>
 
+<div id="toasts" role="status" aria-live="polite"></div>
+
 <script>
 // Minimal ZIP builder using store (no compression) — fine for already-compressed video files.
 class ZipBuilder {
@@ -428,6 +470,8 @@ const state = {
   jobs: {},          // job_id -> snapshot
   sources: {},       // job_id -> EventSource
   tracking: null,    // { tracked_anime, tracking_site, tracking_interval_hrs, events }
+  openErr: new Set(), // keys of error "Details" blocks the user has expanded
+  sseDown: {},        // job_id -> 'reconnecting' | 'closed' while its event stream is down
 };
 
 // --- Utilities ---
@@ -437,6 +481,199 @@ function fmt(bytes) {
   const k = 1024, s = ['B','KB','MB','GB'];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return (bytes / k ** i).toFixed(1) + ' ' + s[i];
+}
+
+// --- Errors ---
+//
+// Every failure is shown the same way: a wrapped one-line summary, and (when there is
+// more to know) a "Details" block with stage, URL, HTTP status, hint, response body and
+// traceback plus a Copy button. The server sends this as {detail, error}; anything the
+// browser raises itself is normalised into the same shape.
+
+class ApiError extends Error {
+  constructor(info, status) {
+    super(info.summary);
+    this.name = 'ApiError';
+    this.info = info;
+    this.status = status;
+  }
+}
+
+function errorText(e) {
+  const out = [e.summary];
+  [['Stage', e.stage], ['Type', e.exc_type], ['URL', e.url],
+   ['HTTP status', e.http_status], ['Attempts', e.attempts]].forEach(([k, v]) => {
+    if (v !== null && v !== undefined && v !== '') out.push(`${k}: ${v}`);
+  });
+  // Extra labelled facts: content type, parser error, where the parse broke, ...
+  Object.entries(e.details || {}).forEach(([k, v]) => out.push(`${k}: ${v}`));
+  if (e.hint) out.push('', 'Hint:', e.hint);
+  if (e.body_snippet) out.push('', 'Response body:', e.body_snippet);
+  if (e.cause_chain && e.cause_chain.length) {
+    out.push('', 'Caused by:', ...e.cause_chain.map(c => '  ' + c));
+  }
+  if (e.traceback) out.push('', 'Traceback:', e.traceback.trimEnd());
+  return out.join('\n');
+}
+
+// Accepts an ApiError, Error, string, or a server ErrorInfo dict.
+function normalizeError(x) {
+  let info;
+  if (x instanceof ApiError) info = x.info;
+  else if (x instanceof Error) info = { summary: x.message || String(x), exc_type: x.name };
+  else if (typeof x === 'string') info = { summary: x };
+  else info = x || {};
+  info = { ...info, summary: info.summary || 'Unknown error' };
+  if (!info.text) info.text = errorText(info);
+  return info;
+}
+
+const errStore = new Map(); // stable key -> plain-text details, for the Copy button
+
+function renderError(x, key, variant) {
+  const e = normalizeError(x);
+  errStore.set(key, e.text);
+  const present = v => v !== null && v !== undefined && v !== '';
+  const rows = [['Stage', e.stage], ['Type', e.exc_type], ['URL', e.url],
+                ['HTTP status', e.http_status], ['Attempts', e.attempts],
+                ...Object.entries(e.details || {})]
+    .filter(([, v]) => present(v));
+  const blocks = [];
+  if (e.hint) blocks.push(['Hint', e.hint]);
+  if (e.body_snippet) blocks.push(['Response body', e.body_snippet]);
+  if (e.cause_chain && e.cause_chain.length) blocks.push(['Caused by', e.cause_chain.join('\n')]);
+  if (e.traceback) blocks.push(['Traceback', e.traceback.trimEnd()]);
+  // A bare stage name isn't worth a toggle.
+  const worthExpanding = blocks.length > 0 || rows.some(([k]) => k !== 'Stage');
+  const k = escHtml(key);
+  const details = worthExpanding ? `
+    <details class="err-details"${state.openErr.has(key) ? ' open' : ''} data-k="${k}" ontoggle="onErrToggle(this)">
+      <summary>Details</summary>
+      <div class="err-body">
+        ${rows.length ? `<dl class="err-grid">${rows.map(([n, v]) => `<dt>${n}</dt><dd>${escHtml(v)}</dd>`).join('')}</dl>` : ''}
+        ${blocks.map(([t, b]) => `<div class="err-label">${t}</div><pre class="err-pre">${escHtml(b)}</pre>`).join('')}
+        <div class="err-actions"><button class="btn-ghost btn-sm" data-k="${k}" onclick="copyErr(this)">Copy details</button></div>
+      </div>
+    </details>` : '';
+  return `<div class="err${variant ? ' ' + variant : ''}"><div class="err-summary">${escHtml(e.summary)}</div>${details}</div>`;
+}
+
+// Job cards re-render every ~0.5s while downloading, which would snap an opened
+// "Details" shut, so remember which ones the user opened.
+function onErrToggle(el) {
+  if (el.open) state.openErr.add(el.dataset.k);
+  else state.openErr.delete(el.dataset.k);
+}
+
+async function copyErr(btn) {
+  const text = errStore.get(btn.dataset.k) || '';
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    // navigator.clipboard is missing on plain-http origins other than localhost.
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed;opacity:0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); } catch {}
+    ta.remove();
+  }
+  const label = btn.textContent;
+  btn.textContent = 'Copied ✓';
+  setTimeout(() => { btn.textContent = label; }, 1500);
+}
+
+let toastSeq = 0;
+
+// kind: 'error' (content is anything normalizeError takes; stays until dismissed)
+//       'success' (content is a string; fades out).
+function toast(kind, content) {
+  const box = document.getElementById('toasts');
+  const err = kind === 'error' ? normalizeError(content) : null;
+  const summary = err ? err.summary : String(content);
+  // Several requests failing for one cause (server down) shouldn't stack identical toasts.
+  const repeat = [...box.children].some(
+    t => t.dataset.summary === summary && Date.now() - Number(t.dataset.at) < 5000
+  );
+  if (repeat) return;
+  const id = ++toastSeq;
+  const el = document.createElement('div');
+  el.className = `toast ${kind}`;
+  el.dataset.summary = summary;
+  el.dataset.at = String(Date.now());
+  el.innerHTML = `<div class="toast-body">${err ? renderError(err, 'toast:' + id) : escHtml(summary)}</div>` +
+    `<button class="toast-close" title="Dismiss" onclick="this.closest('.toast').remove()">×</button>`;
+  box.appendChild(el);
+  while (box.children.length > 4) box.firstElementChild.remove();
+  if (!err) setTimeout(() => el.remove(), 2500);
+}
+
+function fail(x) {
+  console.error(x);
+  toast('error', x);
+}
+
+// fetch() that turns every failure into an ApiError carrying the server's explanation.
+async function apiRaw(path, opts = {}) {
+  const where = `${opts.method || 'GET'} ${path}`;
+  let res;
+  try {
+    res = await fetch(path, opts);
+  } catch (e) {
+    throw new ApiError({
+      summary: "Can't reach the Senpweb server",
+      stage: where,
+      exc_type: e.name,
+      hint: `${e.message}\nIs senpweb still running? Reload the page once it is.`,
+    }, 0);
+  }
+  if (res.ok) return res;
+  const raw = await res.text();
+  let body = null;
+  try { body = JSON.parse(raw); } catch {}
+  let info;
+  if (body && body.detail !== undefined) {
+    const detail = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail);
+    info = body.error
+      ? { ...body.error, summary: detail, stage: body.error.stage || where }
+      : { summary: detail, stage: where, http_status: res.status };
+  } else {
+    // Not our JSON: a reverse proxy's error page, or an unhandled crash.
+    info = {
+      summary: `Server returned HTTP ${res.status} ${res.statusText}`.trim(),
+      stage: where,
+      http_status: res.status,
+      body_snippet: raw.slice(0, 2000),
+      details: {
+        'Content-Type': res.headers.get('content-type') || '(none)',
+        'Response size': `${raw.length.toLocaleString()} chars`,
+      },
+    };
+  }
+  throw new ApiError(info, res.status);
+}
+
+async function api(path, opts = {}) {
+  const res = await apiRaw(path, opts);
+  const raw = await res.text();
+  try {
+    return JSON.parse(raw);
+  } catch (err) {
+    const ctype = res.headers.get('content-type') || 'no content-type';
+    throw new ApiError({
+      summary: `The server sent a response that is not JSON (HTTP ${res.status}, ${ctype}, ${raw.length.toLocaleString()} chars)`,
+      stage: `${opts.method || 'GET'} ${path}`,
+      url: path,
+      http_status: res.status,
+      body_snippet: raw.slice(0, 4000) + (raw.length > 4000 ? `\n…[${(raw.length - 4000).toLocaleString()} more chars not shown]` : ''),
+      details: { 'Parser error': err.message },
+    }, res.status);
+  }
+}
+
+function jsonOpts(method, body) {
+  return { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
 }
 
 function pct(done, total) {
@@ -459,12 +696,12 @@ async function doSearch() {
   document.getElementById('search-results').innerHTML = '';
   hideDetails();
   try {
-    const res = await fetch(`/api/search?q=${encodeURIComponent(q)}&site=${state.site}`);
-    const data = await res.json();
+    const data = await api(`/api/search?q=${encodeURIComponent(q)}&site=${state.site}`);
     state.results = data.results || [];
     renderResults();
   } catch(e) {
-    document.getElementById('search-results').innerHTML = `<div style="color:var(--error);font-size:12px">Search failed: ${escHtml(e.message)}</div>`;
+    console.error(e);
+    document.getElementById('search-results').innerHTML = renderError(e, 'search');
   } finally {
     document.getElementById('search-btn').disabled = false;
     document.getElementById('search-loading').classList.remove('visible');
@@ -494,6 +731,7 @@ function hideDetails() {
   document.getElementById('details-panel').classList.remove('visible');
   document.getElementById('details-content').style.display = 'none';
   document.getElementById('details-loading').classList.remove('visible');
+  document.getElementById('details-error').innerHTML = '';
   state.selected = null;
   state.details = null;
 }
@@ -511,27 +749,25 @@ async function selectAnime(idx) {
   const panel = document.getElementById('details-panel');
   panel.classList.add('visible');
   document.getElementById('details-content').style.display = 'none';
+  document.getElementById('details-error').innerHTML = '';
   document.getElementById('details-loading').classList.add('visible');
 
   try {
-    const res = await fetch('/api/anime/details', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({
-        title: r.title,
-        page_link: r.page_link,
-        anime_id: r.anime_id,
-        site: state.site,
-      }),
-    });
-    if (!res.ok) throw new Error(await res.text());
-    state.details = await res.json();
+    state.details = await api('/api/anime/details', jsonOpts('POST', {
+      title: r.title,
+      page_link: r.page_link,
+      anime_id: r.anime_id,
+      site: state.site,
+    }));
     renderDetails();
   } catch(e) {
+    // Shown beside, not instead of, #details-content: overwriting that element used to
+    // destroy the episode form, so the next successful selection had nothing to fill.
+    console.error(e);
     document.getElementById('details-loading').classList.remove('visible');
-    document.getElementById('details-content').style.display = 'block';
-    document.getElementById('details-content').innerHTML =
-      `<div style="color:var(--error)">Failed to fetch details: ${escHtml(e.message)}</div>`;
+    document.getElementById('details-error').innerHTML =
+      `<div style="font-weight:600;margin-bottom:4px">Couldn't load details for ${escHtml(r.title)}</div>` +
+      renderError(e, 'details');
   }
 }
 
@@ -583,16 +819,10 @@ async function addToQueue() {
       sub_or_dub:    document.getElementById('subdub-sel').value,
       hls_mode:      false,
     };
-    const res = await fetch('/api/queue', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) throw new Error(await res.text());
-    const { job_id } = await res.json();
+    const { job_id } = await api('/api/queue', jsonOpts('POST', body));
     subscribeSSE(job_id);
   } catch(e) {
-    alert('Failed to add to queue: ' + e.message);
+    fail(e);
   } finally {
     btn.disabled = false;
   }
@@ -613,13 +843,17 @@ async function browserDownload() {
       quality:       document.getElementById('quality-sel').value,
       sub_or_dub:    document.getElementById('subdub-sel').value,
     };
-    const res = await fetch('/api/browser-download/resolve', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) throw new Error(await res.text());
-    const { episodes } = await res.json();
+    const { episodes, skipped } = await api(
+      '/api/browser-download/resolve', jsonOpts('POST', body)
+    );
+    // Whatever did resolve is still downloaded; say what didn't, and why.
+    if (skipped && skipped.length) {
+      toast('error', {
+        summary: `${skipped.length} episode(s) couldn't be resolved and won't be downloaded`,
+        stage: 'browser download',
+        hint: skipped.map(s => `${s.title}: ${s.reason}`).join('\n'),
+      });
+    }
 
     if (episodes.length === 1) {
       const a = document.createElement('a');
@@ -632,8 +866,16 @@ async function browserDownload() {
       const zip = new ZipBuilder();
       for (let i = 0; i < episodes.length; i++) {
         btn.textContent = `Fetching ${i + 1} / ${episodes.length}...`;
-        const epRes = await fetch(`/api/browser-download/${episodes[i].token}`);
-        if (!epRes.ok) throw new Error(`Failed to fetch episode ${i + 1}`);
+        let epRes;
+        try {
+          epRes = await apiRaw(`/api/browser-download/${episodes[i].token}`);
+        } catch (err) {
+          const info = normalizeError(err);
+          throw new ApiError(
+            { ...info, summary: `${episodes[i].title}: ${info.summary}`, text: undefined },
+            err.status || 0
+          );
+        }
         const data = await epRes.arrayBuffer();
         zip.addFile(episodes[i].title + '.mp4', data);
       }
@@ -649,7 +891,7 @@ async function browserDownload() {
       URL.revokeObjectURL(url);
     }
   } catch(e) {
-    alert('Browser download failed: ' + e.message);
+    fail(e);
   } finally {
     btn.disabled = false;
     btn.textContent = '⬇ Download to Browser';
@@ -658,8 +900,12 @@ async function browserDownload() {
 
 async function removeJob(job_id) {
   try {
-    await fetch(`/api/queue/${job_id}`, { method: 'DELETE' });
-  } catch {}
+    await api(`/api/queue/${job_id}`, { method: 'DELETE' });
+  } catch (e) {
+    // 404 just means the server already forgot the job (e.g. it restarted); the card
+    // should still go away. Anything else is worth knowing about.
+    if (!(e instanceof ApiError && e.status === 404)) fail(e);
+  }
   delete state.jobs[job_id];
   if (state.sources[job_id]) { state.sources[job_id].close(); delete state.sources[job_id]; }
   const el = document.getElementById('job-' + job_id);
@@ -676,6 +922,7 @@ function subscribeSSE(job_id) {
   state.sources[job_id] = es;
   es.onmessage = (e) => {
     const snap = JSON.parse(e.data);
+    delete state.sseDown[snap.job_id];
     state.jobs[snap.job_id] = snap;
     renderJobCard(snap.job_id);
     updateActiveBadge();
@@ -684,7 +931,12 @@ function subscribeSSE(job_id) {
       delete state.sources[snap.job_id];
     }
   };
-  es.onerror = () => {};
+  // EventSource retries on its own, but a silent stall looks like a hung download.
+  // CLOSED means the browser gave up (e.g. the server answered with an error status).
+  es.onerror = () => {
+    state.sseDown[job_id] = es.readyState === EventSource.CLOSED ? 'closed' : 'reconnecting';
+    renderJobCard(job_id);
+  };
 }
 
 // --- Rendering ---
@@ -754,12 +1006,14 @@ function renderJobCard(job_id) {
       // it gets the reason instead, which is the whole point of surfacing it.
       if (ep.status === 'skipped' || ep.status === 'failed') {
         const label = ep.status === 'skipped' ? 'skipped' : 'failed';
+        const errKey = `${job_id}:${ep.episode_number ?? ep.episode_title}`;
+        const reason = ep.error_detail || ep.error;
         return `<div class="ep-row">
           <div class="ep-name">
             <span>${escHtml(ep.episode_title)}</span>
             <span class="badge badge-${ep.status}">${label}</span>
           </div>
-          ${ep.error ? `<div class="ep-reason">${escHtml(ep.error)}</div>` : ''}
+          ${reason ? renderError(reason, errKey, ep.status === 'skipped' ? 'warn' : '') : ''}
         </div>`;
       }
       const cls = done ? 'ep-done' : '';
@@ -783,7 +1037,12 @@ function renderJobCard(job_id) {
   }
 
   if (j.error_message) {
-    bodyHtml += `<div class="error-msg">${escHtml(j.error_message)}</div>`;
+    bodyHtml += renderError(j.error_detail || j.error_message, `${job_id}:job`);
+  }
+  if (state.sseDown[job_id] && !isTerminal) {
+    bodyHtml += `<div class="conn-note">${state.sseDown[job_id] === 'closed'
+      ? 'Lost the connection to the server. Reload the page to see progress again.'
+      : 'Connection lost, reconnecting…'}</div>`;
   }
 
   const startBtn = isQueued
@@ -808,7 +1067,7 @@ function renderJobCard(job_id) {
       <div class="job-title" title="${escHtml(j.anime_title)}">${escHtml(j.anime_title)}</div>
       <div class="job-meta">
         ${siteBadge}
-        <span style="color:var(--muted);font-size:12px">${epRange}</span>
+        <span class="job-range">${epRange}</span>
         ${statusBadge}
         ${startBtn}
         ${retryBtn}
@@ -824,8 +1083,7 @@ function renderJobCard(job_id) {
 
 async function loadSettings() {
   try {
-    const res = await fetch('/api/settings');
-    state.settings = await res.json();
+    state.settings = await api('/api/settings');
     document.getElementById('s-quality').value = state.settings.quality || '720p';
     document.getElementById('s-subdub').value = state.settings.sub_or_dub || 'sub';
     document.getElementById('s-maxdl').value = state.settings.max_simultaneous_downloads || 2;
@@ -842,7 +1100,9 @@ async function loadSettings() {
         ? '<div style="font-size:11px;color:var(--muted);margin-top:8px">Download folders:</div>' +
           folders.map(f => `<div class="folder-item">${escHtml(f)}</div>`).join('')
         : '';
-  } catch {}
+  } catch (e) {
+    fail(e);
+  }
 }
 
 async function saveSettings() {
@@ -853,18 +1113,15 @@ async function saveSettings() {
     tracking_interval_hrs:      parseInt(document.getElementById('s-trackinterval').value),
   };
   try {
-    await fetch('/api/settings', {
-      method: 'PATCH',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(body),
-    });
+    // Throws on a 4xx/5xx, so "Saved!" is only ever shown after a real save.
+    await api('/api/settings', jsonOpts('PATCH', body));
     state.settings = { ...state.settings, ...body };
     document.getElementById('track-interval-label').textContent = body.tracking_interval_hrs;
     const msg = document.getElementById('save-msg');
     msg.classList.add('visible');
     setTimeout(() => msg.classList.remove('visible'), 2000);
   } catch(e) {
-    alert('Failed to save settings: ' + e.message);
+    fail(e);
   }
 }
 
@@ -872,12 +1129,13 @@ async function saveSettings() {
 
 async function loadTracking() {
   try {
-    const res = await fetch('/api/tracking');
-    const data = await res.json();
+    const data = await api('/api/tracking');
     state.tracking = data;
     document.getElementById('track-interval-label').textContent = data.tracking_interval_hrs;
     renderTracking();
-  } catch {}
+  } catch (e) {
+    fail(e);
+  }
 }
 
 function renderTracking() {
@@ -899,7 +1157,10 @@ function renderTracking() {
 
   const events = document.getElementById('tracking-events');
   events.innerHTML = t.events && t.events.length
-    ? t.events.slice().reverse().map(e => `
+    ? t.events.slice().reverse().map(e => e.kind === 'error' ? `
+        <div style="font-size:11px;color:var(--muted);margin-top:6px">${new Date(e.time * 1000).toLocaleString()}</div>
+        ${renderError({ ...(e.detail || {}), summary: e.message, text: undefined }, 'track:' + e.time)}
+      ` : `
         <div style="font-size:11px;color:var(--muted);margin-top:4px">
           ${new Date(e.time * 1000).toLocaleString()} — ${escHtml(e.message)}
         </div>
@@ -912,15 +1173,10 @@ async function trackCurrentAnime() {
   const btn = document.getElementById('track-btn');
   btn.disabled = true;
   try {
-    const res = await fetch('/api/tracking', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ title: state.selected.title }),
-    });
-    if (!res.ok) throw new Error(await res.text());
+    await api('/api/tracking', jsonOpts('POST', { title: state.selected.title }));
     await loadTracking();
   } catch(e) {
-    alert('Failed to track anime: ' + e.message);
+    fail(e);
   } finally {
     btn.disabled = false;
   }
@@ -928,10 +1184,10 @@ async function trackCurrentAnime() {
 
 async function untrackAnime(title) {
   try {
-    await fetch(`/api/tracking/${encodeURIComponent(title)}`, { method: 'DELETE' });
+    await api(`/api/tracking/${encodeURIComponent(title)}`, { method: 'DELETE' });
     await loadTracking();
   } catch(e) {
-    alert('Failed to untrack anime: ' + e.message);
+    fail(e);
   }
 }
 
@@ -941,13 +1197,12 @@ async function checkTrackingNow() {
   const original = btn.textContent;
   btn.textContent = 'Checking...';
   try {
-    const res = await fetch('/api/tracking/check', { method: 'POST' });
-    const data = await res.json();
+    const data = await api('/api/tracking/check', { method: 'POST' });
     state.tracking = { ...state.tracking, events: data.events };
     await loadTracking();
     await loadQueue();
   } catch(e) {
-    alert('Tracking check failed: ' + e.message);
+    fail(e);
   } finally {
     btn.disabled = false;
     btn.textContent = original;
@@ -957,41 +1212,50 @@ async function checkTrackingNow() {
 // --- Start ---
 
 async function startJob(job_id) {
-  await fetch(`/api/queue/${job_id}/start`, { method: 'POST' });
-  subscribeSSE(job_id);
+  try {
+    await api(`/api/queue/${job_id}/start`, { method: 'POST' });
+    subscribeSSE(job_id);
+  } catch (e) {
+    fail(e);
+  }
 }
 
 async function retryJob(job_id) {
-  await fetch(`/api/queue/${job_id}/retry`, { method: 'POST' });
-  subscribeSSE(job_id);
+  try {
+    await api(`/api/queue/${job_id}/retry`, { method: 'POST' });
+    subscribeSSE(job_id);
+  } catch (e) {
+    fail(e);
+  }
 }
 
 async function retryEpisodes(job_id) {
-  const res = await fetch(`/api/queue/${job_id}/retry-episodes`, { method: 'POST' });
-  if (!res.ok) {
-    alert('Could not retry: ' + await res.text());
-    return;
+  try {
+    // The retry is a new job so the original keeps showing what did download.
+    const { job_id: newId } = await api(`/api/queue/${job_id}/retry-episodes`, { method: 'POST' });
+    await loadQueue();
+    subscribeSSE(newId);
+  } catch (e) {
+    fail(e);
   }
-  // The retry is a new job so the original keeps showing what did download.
-  const { job_id: newId } = await res.json();
-  await loadQueue();
-  subscribeSSE(newId);
 }
 
 async function startAll() {
-  const res = await fetch('/api/queue/start-all', { method: 'POST' });
-  const { started } = await res.json();
-  Object.keys(state.jobs).forEach(id => {
-    if (state.jobs[id].status === 'queued') subscribeSSE(id);
-  });
+  try {
+    await api('/api/queue/start-all', { method: 'POST' });
+    Object.keys(state.jobs).forEach(id => {
+      if (state.jobs[id].status === 'queued') subscribeSSE(id);
+    });
+  } catch (e) {
+    fail(e);
+  }
 }
 
 // --- Init ---
 
 async function loadQueue() {
   try {
-    const res = await fetch('/api/queue');
-    const { jobs } = await res.json();
+    const { jobs } = await api('/api/queue');
     jobs.forEach(j => {
       state.jobs[j.job_id] = j;
       if (!['done','failed','cancelled'].includes(j.status)) {
@@ -999,7 +1263,9 @@ async function loadQueue() {
       }
     });
     renderQueue();
-  } catch {}
+  } catch (e) {
+    fail(e);
+  }
 }
 
 async function init() {

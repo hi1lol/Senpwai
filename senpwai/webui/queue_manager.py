@@ -8,9 +8,19 @@ import uuid
 from typing import Callable
 
 from senpwai.common.classes import SETTINGS, Anime, AnimeDetails, get_max_part_size
+from senpwai.common.errors import ErrorInfo, SenpError, describe_exception, log_error
 from senpwai.common.scraper import Download
-from senpwai.common.static import DUB, GOGO, PAHE, log_exception
+from senpwai.common.static import DUB, GOGO, PAHE
 from senpwai.scrapers import gogo, pahe
+
+
+def _reason_lines(entries: list[tuple[str, str | None]], limit: int | None = 5) -> str:
+    """One ``label: reason`` line per entry, capped at ``limit`` with a "…and N more"."""
+    shown = entries if limit is None else entries[:limit]
+    lines = [f"{label}: {reason or 'no reason recorded'}" for label, reason in shown]
+    if limit is not None and len(entries) > limit:
+        lines.append(f"…and {len(entries) - limit} more")
+    return "\n".join(lines)
 
 
 class EpisodeProgress:
@@ -21,6 +31,7 @@ class EpisodeProgress:
         episode_number: int | None = None,
         status: str = "pending",
         error: str | None = None,
+        error_detail: dict | None = None,
     ) -> None:
         self.episode_title = episode_title
         # pending | downloading | done | failed | skipped
@@ -30,7 +41,10 @@ class EpisodeProgress:
         self.episode_number = episode_number
         self.downloaded_bytes = 0
         self.total_bytes = total_bytes
+        # `error` is the one-line summary; `error_detail` is an ErrorInfo.to_dict()
+        # with the stage, URL, HTTP status and traceback behind it.
         self.error = error
+        self.error_detail = error_detail
 
     def to_dict(self) -> dict:
         return {
@@ -40,6 +54,7 @@ class EpisodeProgress:
             "downloaded_bytes": self.downloaded_bytes,
             "total_bytes": self.total_bytes,
             "error": self.error,
+            "error_detail": self.error_detail,
         }
 
 
@@ -77,6 +92,7 @@ class QueueItem:
         self.resolve_total = 0
         self.episodes: list[EpisodeProgress] = []
         self.error_message: str | None = None
+        self.error_detail: dict | None = None
         self.created_at = time.time()
         self.finished_at: float | None = None
         # Internal — excluded from serialisation
@@ -100,6 +116,7 @@ class QueueItem:
             "resolve_total": self.resolve_total,
             "episodes": [ep.to_dict() for ep in self.episodes],
             "error_message": self.error_message,
+            "error_detail": self.error_detail,
             "created_at": self.created_at,
             "finished_at": self.finished_at,
         }
@@ -157,6 +174,7 @@ class DownloadQueueManager:
         with item._lock:
             item.status = "queued"
             item.error_message = None
+            item.error_detail = None
             item.finished_at = None
             item.episodes = []
             item.resolve_step = ""
@@ -264,6 +282,14 @@ class DownloadQueueManager:
 
     def _run_job(self, item: QueueItem) -> None:
         try:
+            # Building AnimeDetails below scrapes the anime page, which can take
+            # seconds (a FlareSolverr solve) or fail. Mark the job as working before it
+            # starts, so the card doesn't sit on "queued" and a failure there is
+            # reported as happening while resolving.
+            with item._lock:
+                item.resolve_step = "Loading anime details"
+            self._update_status(item, "resolving")
+
             # For gogo dub, update page_link to dub URL before constructing AnimeDetails
             if item.sub_or_dub == DUB and item.site == GOGO:
                 dub_available, page_link = gogo.dub_availability_and_link(item.anime_title)
@@ -293,11 +319,26 @@ class DownloadQueueManager:
             if not ddls:
                 skipped = [ep for ep in item.episodes if ep.status == "skipped"]
                 if skipped:
-                    raise RuntimeError(
+                    raise SenpError(
                         f"Could not resolve a download link for any of the "
-                        f"{len(skipped)} requested episode(s)"
+                        f"{len(skipped)} requested episode(s)",
+                        stage="resolving",
+                        hint=_reason_lines(
+                            [
+                                (
+                                    f"Ep {ep.episode_number}"
+                                    if ep.episode_number is not None
+                                    else ep.episode_title,
+                                    ep.error,
+                                )
+                                for ep in skipped
+                            ]
+                        ),
                     )
-                raise RuntimeError("No episodes to download — you may already have them all")
+                raise SenpError(
+                    "No episodes to download — you may already have them all",
+                    stage="resolving",
+                )
 
             self._update_status(item, "downloading")
             self._do_downloads(item, anime_details, ddls, download_sizes, is_hls)
@@ -309,10 +350,23 @@ class DownloadQueueManager:
                 self._notify_subscribers(item.job_id)
 
         except Exception as e:
+            # `status` still names the phase the job was in (queued / resolving /
+            # downloading) until it is overwritten just below.
+            phase = item.status
+            log_error(
+                "Job %s (%s, eps %d-%d) failed while %s",
+                e,
+                item.job_id,
+                item.anime_title,
+                item.start_episode,
+                item.end_episode,
+                phase,
+            )
             with item._lock:
                 if item.status != "cancelled":
                     item.status = "failed"
-                    item.error_message = str(e)
+                    item.error_message = describe_exception(e)
+                    item.error_detail = ErrorInfo.from_exception(e, stage=phase).to_dict()
                     item.finished_at = time.time()
             self._notify_subscribers(item.job_id)
 
@@ -422,6 +476,7 @@ class DownloadQueueManager:
                 episode_number=anime_details.lacked_episodes[idx],
                 status="skipped",
                 error=reason,
+                error_detail=ErrorInfo.from_message(reason, stage="resolving").to_dict(),
             )
             for idx, reason in sorted(dropped)
             if idx < len(anime_details.lacked_episodes)
@@ -535,6 +590,8 @@ class DownloadQueueManager:
                 if item._cancel_event.is_set():
                     return
 
+                # Which step was running, so a failure says where it happened.
+                phase = "resolving link"
                 try:
                     if download_sizes:
                         size = download_sizes[idx]
@@ -547,10 +604,12 @@ class DownloadQueueManager:
                         # resolving a whole batch upfront risked expiry for episodes
                         # near the end of a long queue.
                         link = pahe.GetDirectDownloadLinks().resolve_one(link)  # type: ignore[arg-type]
+                        phase = "checking file size"
                         size, link = Download.get_total_download_size(  # type: ignore[assignment]
                             link, referer=referer  # type: ignore[arg-type]
                         )
 
+                    phase = "downloading"
                     with item._lock:
                         item.episodes[idx].total_bytes = size
                         item.episodes[idx].status = "downloading"
@@ -576,12 +635,22 @@ class DownloadQueueManager:
                     # Don't let a single episode's failure crash its (daemon) thread
                     # silently — record it so the job can report the failure instead
                     # of falsely completing.
-                    log_exception(e)
+                    summary = describe_exception(e)
+                    log_error(
+                        "Job %s: %s failed while %s",
+                        e,
+                        item.job_id,
+                        anime_details.episode_title(idx, True),
+                        phase,
+                    )
                     with item._lock:
                         item.episodes[idx].status = "failed"
-                        item.episodes[idx].error = str(e)
+                        item.episodes[idx].error = summary
+                        item.episodes[idx].error_detail = ErrorInfo.from_exception(
+                            e, stage=phase
+                        ).to_dict()
                     with failures_lock:
-                        failures.append((idx, str(e)))
+                        failures.append((idx, summary))
                     self._notify_subscribers(item.job_id)
 
         threads = [
@@ -594,11 +663,18 @@ class DownloadQueueManager:
             t.join()
 
         if failures and not item._cancel_event.is_set():
+            ordered = sorted(failures)
             titles = ", ".join(
-                anime_details.episode_title(idx, True) for idx, _ in sorted(failures)
+                anime_details.episode_title(idx, True) for idx, _ in ordered
             )
-            raise RuntimeError(
-                f"Failed to download {len(failures)} episode(s): {titles}"
+            raise SenpError(
+                f"Failed to download {len(failures)} of {len(ddls_or_segs)} "
+                f"episode(s): {titles}",
+                stage="downloading",
+                hint=_reason_lines(
+                    [(anime_details.episode_title(idx, True), why) for idx, why in ordered],
+                    limit=None,
+                ),
             )
 
     def _make_progress_callback(self, item: QueueItem, ep_idx: int) -> Callable[[int], None]:
