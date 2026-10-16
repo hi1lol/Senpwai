@@ -84,6 +84,11 @@ def _check_one(
     if anime_details.sub_or_dub == DUB and not anime_details.dub_available:
         no_dub_callback(anime_details.sanitised_title)
         return None
+    if not anime_details.lacked_episodes:
+        # Still airing and nothing new yet (every released episode is already on disk).
+        # Without this the callback was handed an empty list, which the web UI's
+        # `lacked_episodes[0]` crashed on, and the title was falsely reported as queued.
+        return None
     if start_downloading_immediately:
         start_download_callback(anime_details)
     return anime_details
